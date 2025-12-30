@@ -115,7 +115,7 @@ class ThumbnailMaker:
         
         try:
             canvas.save(output_path, 'JPEG', quality=85, optimize=True)
-            print(f'{output_filename}')
+            #print(f'{output_filename}')
             #print(f'{self.tag}:   画布{canvas_width}×{canvas_height}px, {total_images}张图片, {len(rows)}行')
             return output_path
         except Exception as e:
@@ -154,10 +154,10 @@ class ThumbnailMaker:
         
         image_paths, image_names = self.get_images_sorted_by_time()
         if not image_paths:
-            print(f'{self.tag}: No pictures found')
+            #print(f'{self.tag}: No pictures found')
             return
         
-        print(f'{self.tag}: Finds  {len(image_paths)}')
+        #print(f'{self.tag}: Finds  {len(image_paths)}')
         #print(f'{self.tag}: 正在生成缩略图...')
         
         thumbnails = []
@@ -195,10 +195,10 @@ class ThumbnailMaker:
             
             thumb_idx += consumed
         
-        if created_count > 0:
-            print(f'{self.tag}: Total  {created_count}')
-        else:
-            print(f'{self.tag}: No pictures')
+        # if created_count > 0:
+        #     print(f'{self.tag}: Total  {created_count}')
+        # else:
+        #     print(f'{self.tag}: No pictures')
 
 
 def main(tag):
@@ -207,5 +207,5 @@ def main(tag):
 
 
 if __name__ == '__main__':
-    main('14c')
+    main('weri')
 

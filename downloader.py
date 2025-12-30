@@ -737,16 +737,16 @@ def down_batch_mode3_queue(task_queue, offset=0):
                 # 检查启动文件（支持中断）
                 if not downloader._chk_start():
                     # 把未处理的tag放回队列
-                    downloader.log(f'Interrupted, returning tag to queue: {tag}')
+                    #downloader.log(f'Interrupted, returning tag to queue: {tag}')
                     task_queue.put(tag)
                     break
                 
                 # 检查是否应该跳过
                 if downloader._should_skip_tag(tag):
-                    downloader.log(f'Skip tag in exauthor: {tag}')
+                    downloader.log(f'Skip tag {tag}')
                     continue
                 
-                downloader.log(f'Thread-{offset}: Processing [{processed_count}] {tag}')
+                downloader.log(f' {tag}({offset})')
                 
                 # 下载这个tag的新图片（使用skip逻辑）
                 result = downloader._download_tag_batch(tag, offset)
@@ -776,7 +776,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
     if downloader._chk_start():
         downloader.result['remove_startfile'] = downloader.startfile
     
-    downloader.log(f'End({offset}) processed:{processed_count} done:{len(done_tags)}')
+    downloader.log(f'End({offset}) tags:{processed_count} done:{len(done_tags)}')
     downloader.log('End')
     
     # 收集完成的tag列表
