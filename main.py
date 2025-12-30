@@ -6,7 +6,7 @@
 - 主线程负责所有文件写入操作
 - 工作线程只负责下载和收集数据
 - 通过返回JSON数据避免并发冲突
-- 缩略图生成使用独立单线程池异步处理
+- 缩略图生成在每个tag下载完成后同步执行
 """
 import sys
 import os
@@ -19,20 +19,12 @@ import glob
 from operator import itemgetter
 import set_tag
 from set_tag import writefile, readfile
-from downloader import down_single, down_batch_mode3_queue, set_sample_executor
+from downloader import down_single, down_batch_mode3_queue
 from core import config, get_database, load_tag_mapping, format_size
-
-# 全局缩略图线程池（单线程，避免PIL并发问题）
-sample_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='sample')
-
-# 设置到downloader模块
-set_sample_executor(sample_executor)
 
 
 def _cleanup_on_exit():
     """程序退出时清理资源"""
-    # 关闭缩略图线程池
-    sample_executor.shutdown(wait=True)
     # 关闭数据库连接
     try:
         get_database().close_all_connections()
@@ -96,8 +88,7 @@ def write_tag_time(tag_time_dict):
                     continue
                 parts = line.split(': ', 1)
                 if len(parts) != 2:
-                    continue
- # 解析时间（支持新旧格式）
+                    continue# 解析时间（支持新旧格式）
                 if '|time1:' in line:
                     # 新格式: |time1: xxx|time2: xxx|time3: xxx|time4: xxx
                     # 一次性解析完成
@@ -231,7 +222,7 @@ def handle_result(result):
     
     # 5. 删除启动文件
     if result.get('remove_startfile') and os.path.exists(result.get('remove_startfile')):
-       os.remove(result['remove_startfile'])
+        os.remove(result['remove_startfile'])
     
     # 6. 添加过期tag
     if result.get('expire_tags'):
@@ -442,9 +433,6 @@ def mode_1():
                         
                         print(f"✓ [{completed_count}] {tag} 完成")
                         
-                        # 立即标记done（避免下次重新读取）
-                        if result.get('set_input_done'):
-                            set_tag.set_input_done(result['set_input_done'])
                     except Exception as e:
                         print(f"✗ {tag} 出错: {e}")
                 
@@ -455,7 +443,7 @@ def mode_1():
                     processed_tags.add(new_tag)
                     print(f"🆕 发现新标签: {new_tag}")
                 
-                # 补充新任务到线程池（保持6个并发）
+        # 补充新任务到线程池（保持6个并发）
                 while not task_queue.empty() and len(active_futures) < 6:
                     tag, tag_config = task_queue.get()
                     future = executor.submit(down_single, tag, tag_config)
@@ -598,7 +586,7 @@ def mode_3():
             futures = {executor.submit(down_batch_mode3_queue, task_queue, i+1): i+1 
                       for i in range(available)}
             
-            # 8. 收集结果
+            # 8. 收集结果（每个线程独立，删除对应.start只停止对应线程）
             for future in concurrent.futures.as_completed(futures):
                 offset = futures[future]
                 try:
@@ -621,13 +609,22 @@ def mode_3():
                     total_size += stats.get('total_size', 0)
                     
                     done_count = len(result.get('done_tags', []))
-                    print(f"✓ 线程{offset} 完成: {done_count} 个tag")
+                    interrupted_msg = " (interrupted)" if result.get('interrupted') else ""
+                    print(f"✓ 线程{offset} 完成: {done_count} 个tag{interrupted_msg}")
                     
                 except Exception as e:
                     print(f"✗ 线程{offset} 出错: {e}")
         
-        # 9. 等待所有任务完成
-        task_queue.join()
+        # 9. 清空队列中可能残留的任务（线程已全部退出，直接清理）
+        remaining = 0
+        while not task_queue.empty():
+            try:
+                task_queue.get_nowait()
+                remaining += 1
+            except:
+                break
+        if remaining > 0:
+            print(f"⚠ 清理了 {remaining} 个未处理的队列任务")
         
         elapsed_minutes = (time.time() - start_time) / 60
         
@@ -638,20 +635,45 @@ def mode_3():
         
         if all_done_tags:
             set_tag.add_tags(all_done_tags)
-        print(f"已添加 {len(all_done_tags)} 个tag到 tags.txt")
-    
-        # 11. 输出汇总统计
+            print(f"已添加 {len(all_done_tags)} 个tag到 tags.txt")
+        
+        # 11. 输出汇总日志（仅打印到控制台）
+        def print_summary_log(msg):
+            current_time = time.strftime('%Y-%m-%d %H:%M:%S')
+            formatted_msg = f"{current_time} | {msg}"
+            print(formatted_msg)
+        
+        if total_downloaded > 0:
+            if total_size < 1024 * 1024:
+                total_size_str = f"{total_size / 1024:.2f} Kb"
+                avg_size_str = f"{total_size / total_downloaded / 1024:.2f} Kb"
+            elif total_size < 1024 * 1024 * 1024:
+                total_size_str = f"{total_size / 1024 / 1024:.2f} Mb"
+                avg_size_str = f"{total_size / total_downloaded / 1024 / 1024:.2f} Mb"
+            else:
+                total_size_str = f"{total_size / 1024 / 1024 / 1024:.2f} Gb"
+                avg_size_str = f"{total_size / total_downloaded / 1024 / 1024:.2f} Mb"
+            print_summary_log(f'Total size: {total_size_str}  avg size: {avg_size_str}')
+            print_summary_log(f'Total download: {total_downloaded} failed: {total_failed}')
+        
+        # 输出 expired tag 统计
+        nulltag_count = 0
+        nulltag_path = config['path'].get('nulltag', config['path'].get('deadtag'))
+        if nulltag_path and os.path.exists(nulltag_path):
+            with open(nulltag_path, 'r') as fd:
+                nulltag_count = sum(1 for _ in fd)
+        print_summary_log(f'expired tag: {nulltag_count}')
+        
+        print_summary_log(f'End tags:{len(all_done_tags)}')
+        print_summary_log('End')
+        
+        # 12. 输出汇总统计（控制台）
         print(f"\n{'='*50}")
         print(f"  总耗时: {elapsed_minutes:.1f} 分钟")
-        # 计算下载大小字符串
-        if total_size < 1024 * 1024:
-            total_size_str = f"{total_size / 1024:.2f} KB"
-        elif total_size < 1024 * 1024 * 1024:
-            total_size_str = f"{total_size / 1024 / 1024:.2f} MB"
-        else:
-            total_size_str = f"{total_size / 1024 / 1024 / 1024:.2f} GB"
-        print(f"  已处理: {len(all_done_tags)}/{len(taglist)} 个tag 下载数量 {total_downloaded} 下载大小 {total_size_str}")
-        print_summary_statistics(total_downloaded, total_failed, total_size)
+        print(f"  已处理: {len(all_done_tags)}/{len(taglist)} 个tag")
+        print(f"  下载数量: {total_downloaded}  失败: {total_failed}")
+        if total_downloaded > 0:
+            print(f"  下载大小: {total_size_str}")
         print(f"{'='*50}\n")
     
     finally:
@@ -668,13 +690,166 @@ def mode_4():
     print("已完成标签清理完毕")
 
 
+def mode_5(old_tag: str, new_tag: str):
+    """
+    模式5: 修改图片的tag_name
+    
+    用于处理tag名称变更的情况，例如艺术家改名
+    
+    Args:
+        old_tag: 旧的tag名称
+        new_tag: 新的tag名称
+    
+    更新内容:
+        - tag_name: old_tag -> new_tag
+        - file_path: 替换路径中的old_tag为new_tag
+        - pic_tags: 追加new_tag，旧tag加_old后缀
+    """
+    from core import get_database
+    
+    print(f"\n=== Mode 5: 修改图片tag_name ===")
+    print(f"  旧tag: {old_tag}")
+    print(f"  新tag: {new_tag}\n")
+    
+    db = get_database()
+    gelbooru_path = config['path']['Gelbooru']
+    
+    try:
+        # 检查旧tag是否存在
+        existing = db.get_pictures_by_tag(old_tag)
+        if not existing:
+            print(f"❌ 数据库中没有找到tag: {old_tag}")
+            return
+        
+        print(f"找到 {len(existing)} 张图片需要更新")
+        
+        # 执行更新
+        updated_count = db.update_picture_tag_name(old_tag, new_tag, gelbooru_path)
+        
+        print(f"✓ 成功更新 {updated_count} 条记录")
+        print(f"\n注意: 请手动将文件夹从 {old_tag} 重命名为 {new_tag}")
+        print(f"  路径: {gelbooru_path}\\{old_tag} -> {gelbooru_path}\\{new_tag}")
+        
+    except Exception as e:
+        print(f"❌ 更新失败: {e}")
+    finally:
+        try:
+            db.close_all_connections()
+        except Exception:
+            pass
+
+
+def mode_6():
+    """模式6: 更新图片信息（Mode 3变种，不下载只更新DB）"""
+    from downloader import update_batch_mode6_queue
+    
+    try:
+        print("\n=== Mode 6: 更新图片信息 ===\n")
+        
+        # 1. 初始化标签列表（与Mode 3相同）
+        set_tag.add_folder_tag()
+        set_tag.init_input(1)
+        set_tag.add_dead_tag()
+        taglist = set_tag.read_tags()
+        
+        if not taglist:
+            print("没有可处理的标签")
+            return
+        
+        print(f"总标签数: {len(taglist)}")
+        
+        # 2. 检查运行中的任务
+        end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
+        running = len(end_files)
+        workers = 6
+        
+        if running >= workers:
+            print(f"已有{running}个任务运行中，无法启动新任务")
+            return
+        
+        # 3. 计算可用线程数
+        available = workers - running
+        print(f"运行中任务: {running}, 可用线程: {available}/{workers}")
+        
+        # 4. 创建任务队列并填充
+        task_queue = queue.Queue()
+        for tag in taglist:
+            task_queue.put(tag)
+        
+        # 5. 添加结束标记
+        for _ in range(available):
+            task_queue.put(None)
+        
+        print(f"任务队列已创建: {len(taglist)} 个tag\n")
+        
+        # 6. 数据收集变量
+        total_added = 0
+        total_updated = 0
+        total_skipped = 0
+        
+        start_time = time.time()
+        
+        # 7. 启动工作线程
+        with concurrent.futures.ThreadPoolExecutor(max_workers=available) as executor:
+            futures = {executor.submit(update_batch_mode6_queue, task_queue, i+1): i+1 
+                      for i in range(available)}
+            
+            # 8. 收集结果（每个线程独立，删除对应.start只停止对应线程）
+            for future in concurrent.futures.as_completed(futures):
+                offset = futures[future]
+                try:
+                    result = future.result()
+                    
+                    # 收集统计数据
+                    stats = result.get('statistics', {})
+                    total_added += stats.get('added', 0)
+                    total_updated += stats.get('updated', 0)
+                    total_skipped += stats.get('skipped', 0)
+                    
+                    done_count = result.get('processed_count', 0)
+                    interrupted_msg = " (interrupted)" if result.get('interrupted') else ""
+                    print(f"✓ 线程{offset} 完成: {done_count} 个tag{interrupted_msg}")
+                    
+                except Exception as e:
+                    print(f"✗ 线程{offset} 出错: {e}")
+        
+        # 9. 清空队列中可能残留的任务（线程已全部退出，直接清理）
+        remaining = 0
+        while not task_queue.empty():
+            try:
+                task_queue.get_nowait()
+                remaining += 1
+            except:
+                break
+        if remaining > 0:
+            print(f"⚠ 清理了 {remaining} 个未处理的队列任务")
+        
+        elapsed_minutes = (time.time() - start_time) / 60
+        
+        # 10. 输出汇总统计
+        print(f"\n{'='*50}")
+        print(f"  总耗时: {elapsed_minutes:.1f} 分钟")
+        print(f"  新增记录: {total_added}")
+        print(f"  更新记录: {total_updated}")
+        print(f"  跳过(本地无文件): {total_skipped}")
+        print(f"{'='*50}\n")
+        
+    finally:
+        try:
+            get_database().close_all_connections()
+        except Exception as e:
+            print(f"⚠️  关闭数据库连接失败: {e}")
+
+
 def main():
     """主函数"""
     if len(sys.argv) < 2:
-        print("使用方法: python main.py [1|3|4]")
+        print("使用方法: python main.py [1|3|4|5|6]")
         print("  1 - 下载新标签（自动恢复中断）")
         print("  3 - 下载所有旧标签")
         print("  4 - 清理已完成记录")
+        print("  5 old_tag new_tag - 修改图片tag_name")
+        print("  6 - 更新图片信息（不下载）")
         return
     
     mode = sys.argv[1]
@@ -686,14 +861,18 @@ def main():
             mode_3()
         elif mode == '4':
             mode_4()
+        elif mode == '5':
+            if len(sys.argv) < 4:
+                print("Mode 5 需要两个参数: python main.py 5 old_tag new_tag")
+                return
+            mode_5(sys.argv[2], sys.argv[3])
+        elif mode == '6':
+            mode_6()
         else:
             print(f"未知模式: {mode}")
-            print("可用模式: 1（新标签+恢复中断）, 3（所有旧标签）, 4（清理）")
+            print("可用模式: 1, 3, 4, 5, 6")
     finally:
-        # 等待所有缩略图任务完成
-        print("\n等待缩略图生成完成...")
-        sample_executor.shutdown(wait=True)
-        print("所有任务完成")
+        print("\n所有任务完成")
 
 
 if __name__ == '__main__':

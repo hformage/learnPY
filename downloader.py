@@ -15,21 +15,13 @@ from core import Regex, read_lines, get_max_file_number, format_size, get_databa
 import set_tag
 import sampletag
 
-# 全局缩略图线程池（由main.py设置）
-_sample_executor = None
-
-def set_sample_executor(executor):
-    """设置缩略图线程池"""
-    global _sample_executor
-    _sample_executor = executor
-
-def _submit_sample_task(tag_name):
-    """提交缩略图生成任务（异步，不等待）"""
-    if _sample_executor and tag_name:
+def _run_sample_sync(tag_name):
+    """同步执行缩略图生成任务（每个tag下载完成后立即执行并等待完成）"""
+    if tag_name:
         try:
-            _sample_executor.submit(sampletag.main, tag_name)
+            sampletag.main(tag_name)
         except Exception as e:
-            print(f"提交缩略图任务失败: {e}")
+            print(f"缩略图任务失败: {e}")
 
 
 class Downloader:
@@ -347,7 +339,7 @@ class Downloader:
         
         Returns:
             dict: 包含所有需要写入的数据
-        """
+     """
         self.init_single(tag)
         self.tag = tag
         self.tag_config = tag_config.copy()  # 复制一份避免修改原始数据
@@ -519,23 +511,23 @@ class Downloader:
         
         # 检查过期标签
         self._check_expire()
-        
         self.log('End')
         
-        # 异步提交缩略图任务（如果有下载）
+        # 同步执行缩略图任务（如果有下载）
         if self.downed_cnt > 0 and self.replace_tag:
-            _submit_sample_task(self.replace_tag)
+            _run_sample_sync(self.replace_tag)
         
         # 返回所有收集的数据
         return self.result
     
-    def _download_tag_batch(self, tag, offset):
+    def _download_tag_batch(self, tag, offset, tag_index=0):
         """
         Mode 3 单个tag的批量下载逻辑（连续skip 2次停止）
         
         Args:
             tag: 标签名
             offset: 线程编号
+            tag_index: 当前是第几个tag（用于日志输出）
         
         Returns:
             bool: 是否成功下载
@@ -665,8 +657,8 @@ class Downloader:
             size_str = format_size(total_size_this_tag)
             self.log(f'count: {downloaded_this_tag} size: {size_str}')
             
-            # 异步提交缩略图任务
-            _submit_sample_task(self.replace_tag)
+            # 同步执行缩略图任务
+            _run_sample_sync(self.replace_tag)
         
         # 收集统计信息，确保主流程能正确统计
         self.result['statistics'] = {
@@ -701,6 +693,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
     - 动态任务分配：工作线程从共享队列取tag
     - 自动负载均衡：完成快的线程处理更多任务
     - 线程安全：queue.Queue 保证并发安全
+    - 每个线程有独立的 .start 文件，删除对应文件只停止对应线程
     
     Args:
         task_queue: queue.Queue 实例，包含待处理的tag
@@ -719,11 +712,18 @@ def down_batch_mode3_queue(task_queue, offset=0):
     
     done_tags = []
     processed_count = 0
+    interrupted = False  # 标记是否被中断
     
     while True:
+        # 先检查自己的启动文件（在取任务前检查，快速响应中断）
+        if not downloader._chk_start():
+            downloader.log(f'Start file deleted, exiting...')
+            interrupted = True
+            break
+        
         try:
-            # 从队列取tag（超时1秒）
-            tag = task_queue.get(timeout=1)
+            # 从队列取tag（超时0.5秒，更快响应中断）
+            tag = task_queue.get(timeout=0.5)
             
             # 遇到结束标记（None），退出循环
             if tag is None:
@@ -734,11 +734,11 @@ def down_batch_mode3_queue(task_queue, offset=0):
             try:
                 processed_count += 1
                 
-                # 检查启动文件（支持中断）
+                # 检查启动文件（支持中断）- 在处理任务时再次检查
                 if not downloader._chk_start():
-                    # 把未处理的tag放回队列
-                    #downloader.log(f'Interrupted, returning tag to queue: {tag}')
-                    task_queue.put(tag)
+                    downloader.log(f'Interrupted at tag: {tag}')
+                    task_queue.task_done()
+                    interrupted = True
                     break
                 
                 # 检查是否应该跳过
@@ -746,13 +746,14 @@ def down_batch_mode3_queue(task_queue, offset=0):
                     downloader.log(f'Skip tag {tag}')
                     continue
                 
-                downloader.log(f'Tag({offset})  {tag}')
+                # 获取当前页数用于日志
+                file_counter = downloader._get_max_file_num()
+                downloader.log(f'Tag({offset})/({processed_count}): {file_counter} {tag}')
                 
                 # 下载这个tag的新图片（使用skip逻辑）
-                result = downloader._download_tag_batch(tag, offset)
+                result = downloader._download_tag_batch(tag, offset, processed_count)
                 
-                if result:
-                    done_tags.append(tag)
+                done_tags.append(tag)
             finally:
                 # 确保任务标记为完成 (#16修复死锁风险)
                 task_queue.task_done()
@@ -776,10 +777,240 @@ def down_batch_mode3_queue(task_queue, offset=0):
     if downloader._chk_start():
         downloader.result['remove_startfile'] = downloader.startfile
     
+    # 输出统计信息（与旧代码格式一致）
+    if downloader.downed_cnt > 0:
+        total_size = downloader.total_download_size
+        if total_size < 1024 * 1024:
+            total_size_str = f"{total_size / 1024:.2f} Kb"
+            avg_size_str = f"{total_size / downloader.downed_cnt / 1024:.2f} Kb"
+        elif total_size < 1024 * 1024 * 1024:
+            total_size_str = f"{total_size / 1024 / 1024:.2f} Mb"
+            avg_size_str = f"{total_size / downloader.downed_cnt / 1024 / 1024:.2f} Mb"
+        else:
+            total_size_str = f"{total_size / 1024 / 1024 / 1024:.2f} Gb"
+            avg_size_str = f"{total_size / downloader.downed_cnt / 1024 / 1024:.2f} Mb"
+        downloader.log(f'Total size({offset}): {total_size_str}  avg size: {avg_size_str}')
+        downloader.log(f'Total download({offset}): {downloader.downed_cnt} failed: {downloader.failed_cnt}')
+    
+    # 检查过期标签
+    downloader._check_expire()
+    
     downloader.log(f'End({offset}) tags:{processed_count} done:{len(done_tags)}')
     downloader.log('End')
     
-    # 收集完成的tag列表
+    # 收集完成的tag列表和中断标志
     downloader.result['done_tags'] = done_tags
+    downloader.result['interrupted'] = interrupted
     
     return downloader.result
+
+
+def update_batch_mode6_queue(task_queue, offset):
+    """
+    Mode 6: 更新图片信息（不下载，只对比并更新DB）
+    
+    流程：
+    1. 遍历网站上tag的所有图片
+    2. 对比本地是否存在该文件
+    3. 如果本地有文件但DB无记录 -> 添加记录
+    4. 如果网站有信息但本地无文件 -> 跳过
+    
+    每个线程有独立的 .start 文件，删除对应文件只停止对应线程
+    
+    Args:
+        task_queue: 任务队列
+        offset: 线程编号
+    
+    Returns:
+        dict: 统计结果
+    """
+    downloader = Downloader()
+    downloader.init_batch(offset)
+    downloader.log('Mode 6 Start - Update DB Info')
+    
+    # 创建启动文件
+    with open(downloader.startfile, 'w') as f:
+        f.write('')
+    
+    processed_count = 0
+    total_added = 0
+    total_updated = 0
+    total_skipped = 0
+    interrupted = False
+    
+    while True:
+        # 先检查自己的启动文件（在取任务前检查，快速响应中断）
+        if not downloader._chk_start():
+            downloader.log(f'Start file deleted, exiting...')
+            interrupted = True
+            break
+        
+        try:
+            tag = task_queue.get(timeout=0.5)
+            
+            if tag is None:
+                task_queue.task_done()
+                break
+            
+            try:
+                processed_count += 1
+                
+                # 检查启动文件（支持中断）- 在处理任务时再次检查
+                if not downloader._chk_start():
+                    downloader.log(f'Interrupted at tag: {tag}')
+                    task_queue.task_done()
+                    interrupted = True
+                    break
+                
+                # 检查是否应该跳过
+                if downloader._should_skip_tag(tag):
+                    downloader.log(f'Skip tag {tag}')
+                    continue
+                
+                downloader.log(f'Update({offset})/({processed_count}): {tag}')
+                
+                # 处理这个tag
+                added, updated, skipped = _update_tag_info(downloader, tag)
+                total_added += added
+                total_updated += updated
+                total_skipped += skipped
+                
+                downloader.log(f'Tag {tag}: added={added}, updated={updated}, skipped={skipped}')
+                
+            finally:
+                task_queue.task_done()
+            
+        except queue.Empty:
+            if task_queue.empty():
+                break
+            continue
+            
+        except Exception as e:
+            downloader.log(f'Error processing tag: {str(e)}')
+            try:
+                task_queue.task_done()
+            except Exception:
+                pass
+            continue
+    
+    # 删除启动文件
+    if downloader._chk_start():
+        downloader.result['remove_startfile'] = downloader.startfile
+    
+    downloader.log(f'Total: added={total_added}, updated={total_updated}, skipped={total_skipped}')
+    downloader.log(f'End({offset}) processed:{processed_count}')
+    downloader.log('End')
+    
+    # 收集统计
+    downloader.result['statistics'] = {
+        'added': total_added,
+        'updated': total_updated,
+        'skipped': total_skipped
+    }
+    downloader.result['processed_count'] = processed_count
+    downloader.result['interrupted'] = interrupted
+    
+    return downloader.result
+
+
+def _update_tag_info(downloader, tag):
+    """
+    更新单个tag的图片信息
+    
+    Args:
+        downloader: Downloader实例
+        tag: 标签名
+    
+    Returns:
+        tuple: (added_count, updated_count, skipped_count)
+    """
+    replace_tag = downloader._normalize_tag(tag)
+    added_count = 0
+    updated_count = 0
+    skipped_count = 0
+    
+    # 获取本地文件夹中的所有文件
+    local_path = os.path.join(downloader.gelbooru_path, replace_tag)
+    if not os.path.exists(local_path):
+        downloader.log(f'Local folder not found: {local_path}')
+        return 0, 0, 0
+    
+    # 获取本地所有图片文件名
+    local_files = set()
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.webm'}
+    for filename in os.listdir(local_path):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in valid_extensions:
+            local_files.add(filename)
+    
+    if not local_files:
+        downloader.log(f'No image files in {local_path}')
+        return 0, 0, 0
+    
+    # 获取DB中已有的记录
+    db_records = downloader.db.get_local_filenames_by_tag(replace_tag)
+    
+    # 遍历网站上的图片
+    page = 0
+    base_tag_url = downloader.base_url + tag + downloader._exclude_url(tag)
+    
+    while True:
+        page += 1
+        url = base_tag_url + downloader._get_page_url(page)
+        soup = downloader.web.get_soup(url, retries=50)
+        
+        if not soup:
+            break
+        
+        image_urls = downloader.web.get_image_list(soup)
+        if not image_urls:
+            break
+        
+        # 遍历图片
+        for img_url in image_urls:
+            # 获取详情页
+            detail_soup = downloader.web.get_soup(img_url, retries=50)
+            if not detail_soup:
+                continue
+            
+            pic_time, pic_date, pic_id, pic_url, pic_tags, pic_filename = downloader._extract_metadata(detail_soup)
+            if not pic_filename:
+                continue
+            
+            # 检查本地是否存在该文件
+            if pic_filename not in local_files:
+                skipped_count += 1
+                continue
+            
+            # 检查DB是否已有记录
+            if pic_filename in db_records:
+                # 已有记录，可以选择更新（当前跳过）
+                # 如果需要更新信息，可以在这里添加逻辑
+                continue
+            
+            # 本地有文件但DB无记录，添加记录
+            file_path = os.path.join(local_path, pic_filename)
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            
+            pic_data = {
+                'pic_id': pic_id,
+                'tag_name': replace_tag,
+                'filename': pic_filename,
+                'new_filename': None,
+                'file_path': file_path,
+                'file_size': file_size,
+                'pic_url': pic_url,
+                'pic_tags': pic_tags,
+                'pic_time': pic_time,
+                'pic_date': pic_date
+            }
+            
+            downloader.db.add_picture(pic_data)
+            added_count += 1
+            downloader.log(f'Tag {tag} db insert: {pic_filename} (ID: {pic_id})')
+        
+        # 每页处理完后检查是否中断
+        if not downloader._chk_start():
+            break
+    
+    return added_count, updated_count, skipped_count

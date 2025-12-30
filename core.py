@@ -185,11 +185,11 @@ def format_size(size_bytes: int) -> str:
     if size_bytes < 1024:
         return f"{size_bytes} B"
     elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.2f} KB"
+        return f"{size_bytes / 1024:.2f} Kb"
     elif size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / 1024 / 1024:.2f} MB"
+        return f"{size_bytes / 1024 / 1024:.2f} Mb"
     else:
-        return f"{size_bytes / 1024 / 1024 / 1024:.2f} GB"
+        return f"{size_bytes / 1024 / 1024 / 1024:.2f} Gb"
 
 
 def load_tag_mapping(reverse: bool = False) -> dict:
@@ -565,7 +565,6 @@ class DatabaseManager:
                 (tag, startpage, endpage, start_pic, end_pic, status, updated_at)
                 VALUES (?, 1, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """, (tag, endpage, start_pic, end_pic, status))
-    
     def get_tag_progress(self, tag: str) -> Optional[Dict]:
         """获取标签下载进度"""
         with self.get_cursor() as cursor:
@@ -629,6 +628,82 @@ class DatabaseManager:
         """删除标签进度"""
         with self.get_cursor() as cursor:
             cursor.execute('DELETE FROM tag_progress WHERE tag=?', (tag,))
+    
+    # ============ Mode 5: 更新图片tag_name ============
+    
+    def update_picture_tag_name(self, old_tag: str, new_tag: str, gelbooru_path: str) -> int:
+        """
+        更新图片的tag_name（Mode 5专用）
+        
+        Args:
+            old_tag: 旧的tag名称
+            new_tag: 新的tag名称
+            gelbooru_path: Gelbooru基础路径（如 F:\\Pic\\Gelbooru）
+        
+        Returns:
+            int: 更新的记录数
+        
+        更新内容:
+            - tag_name: old_tag -> new_tag
+            - file_path: 替换路径中的old_tag为new_tag
+            - pic_tags: 追加new_tag，旧tag加_old后缀
+        """
+        with self.get_cursor() as cursor:
+            # 获取所有需要更新的记录
+            cursor.execute('SELECT pic_id, file_path, pic_tags FROM pictures WHERE tag_name=?', (old_tag,))
+            rows = cursor.fetchall()
+            
+            if not rows:
+                return 0
+            
+            updated_count = 0
+            for row in rows:
+                pic_id = row['pic_id']
+                old_path = row['file_path']
+                old_pic_tags = row['pic_tags'] or ''
+                
+                # 更新file_path: 替换路径中的tag文件夹名
+                new_path = old_path.replace(f'{gelbooru_path}\\{old_tag}\\', f'{gelbooru_path}\\{new_tag}\\')
+                
+                # 更新pic_tags: 旧tag加_old后缀，追加新tag到最后
+                if old_pic_tags:
+                    # 替换旧tag为旧tag_old
+                    new_pic_tags = old_pic_tags.replace(old_tag, f'{old_tag}_old')
+                    # 追加新tag到最后
+                    new_pic_tags = f'{new_pic_tags} {new_tag}'
+                else:
+                    new_pic_tags = new_tag
+                
+                # 执行更新
+                cursor.execute("""
+                    UPDATE pictures 
+                    SET tag_name=?, file_path=?, pic_tags=?
+                    WHERE pic_id=? AND tag_name=?
+                """, (new_tag, new_path, new_pic_tags, pic_id, old_tag))
+                
+                updated_count += cursor.rowcount
+            
+            return updated_count
+    
+    def get_all_pic_ids_by_tag(self, tag_name: str) -> List[str]:
+        """获取tag下所有图片的pic_id列表"""
+        with self.get_cursor() as cursor:
+            cursor.execute('SELECT pic_id FROM pictures WHERE tag_name=?', (tag_name,))
+            return [row['pic_id'] for row in cursor.fetchall()]
+    
+    def get_local_filenames_by_tag(self, tag_name: str) -> Dict[str, Dict]:
+        """
+        获取tag下所有本地图片的文件名和信息（Mode 6专用）
+        
+        Returns:
+            Dict[filename, {pic_id, file_path, ...}]
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute('SELECT * FROM pictures WHERE tag_name=?', (tag_name,))
+            result = {}
+            for row in cursor.fetchall():
+                result[row['filename']] = dict(row)
+            return result
     
     def close_all_connections(self):
         """关闭所有连接"""

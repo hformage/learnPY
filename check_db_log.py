@@ -82,6 +82,16 @@ class DatabaseManager:
             cursor.execute('SELECT * FROM pictures WHERE pic_id=?', (pic_id,))
             return [dict(row) for row in cursor.fetchall()]
     
+    def get_tag_by_filename(self, filename: str) -> List[Dict]:
+        """根据文件名查询tag信息（支持带或不带扩展名）"""
+        with self.get_cursor() as cursor:
+            # 如果输入不包含扩展名，使用LIKE模糊匹配
+            if '.' not in filename:
+                cursor.execute('SELECT * FROM pictures WHERE filename LIKE ?', (f'{filename}.%',))
+            else:
+                cursor.execute('SELECT * FROM pictures WHERE filename=?', (filename,))
+            return [dict(row) for row in cursor.fetchall()]
+    
     def search_pictures_by_tags(self, tags: List[str]) -> List[Dict]:
         """根据标签搜索图片（任意匹配）"""
         with self.get_cursor() as cursor:
@@ -90,6 +100,12 @@ class DatabaseManager:
             query = f'SELECT * FROM pictures WHERE {conditions} ORDER BY pic_time DESC'
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+    
+    def get_all_tags(self) -> List[str]:
+        """获取所有唯一的tag_name"""
+        with self.get_cursor() as cursor:
+            cursor.execute('SELECT DISTINCT tag_name FROM pictures ORDER BY tag_name')
+            return [row[0] for row in cursor.fetchall()]
     
     def execute_sql(self, sql: str) -> tuple:
         """执行自定义SQL，返回(columns, rows)"""
@@ -134,7 +150,7 @@ class DBQueryGUI:
     
     def _create_widgets(self):
         """创建所有控件"""
-        # 主框架
+  # 主框架
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -151,8 +167,11 @@ class DBQueryGUI:
         # 分割线
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
-      # ===== 显示所有表名 =====
-        ttk.Button(main_frame, text="显示所有表名", command=self._show_tables).pack(anchor=tk.W)
+        # ===== 显示所有表名 / 显示所有tag =====
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="显示所有表名", command=self._show_tables).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="显示所有tag", command=self._show_all_tags).pack(side=tk.LEFT, padx=10)
         
         # 分割线
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
@@ -168,6 +187,7 @@ class DBQueryGUI:
         self.tag_entry = ttk.Entry(row1, width=50)
         self.tag_entry.pack(side=tk.LEFT, padx=5)
         ttk.Button(row1, text="Search", command=self._search_by_tag, width=10).pack(side=tk.LEFT)
+        ttk.Button(row1, text="Clear", command=self._clear_input_fields, width=8).pack(side=tk.RIGHT)
         
         # 根据图片ID查询tag名字
         row2 = ttk.Frame(query_frame)
@@ -176,6 +196,15 @@ class DBQueryGUI:
         self.pic_id_entry = ttk.Entry(row2, width=50)
         self.pic_id_entry.pack(side=tk.LEFT, padx=5)
         ttk.Button(row2, text="Search", command=self._search_by_pic_id, width=10).pack(side=tk.LEFT)
+        
+        # 根据文件名查询tag名字
+        row2b = ttk.Frame(query_frame)
+        row2b.pack(fill=tk.X, pady=2)
+        ttk.Label(row2b, text="查询tag名字(文件名):", width=20, anchor='w').pack(side=tk.LEFT)
+        self.filename_entry = ttk.Entry(row2b, width=50)
+        self.filename_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(row2b, text="Search", command=self._search_by_filename, width=10).pack(side=tk.LEFT)
+        ttk.Label(row2b, text="(xxxx 或 xxxx.jpg)", foreground="gray").pack(side=tk.LEFT, padx=5)
         
         # 根据tags查找图片
         row3 = ttk.Frame(query_frame)
@@ -222,18 +251,16 @@ class DBQueryGUI:
         self.result_label.pack(side=tk.RIGHT)
         
         # ===== 结果显示 =====
-        self.result_text = scrolledtext.ScrolledText(main_frame, wrap=tk.NONE)
+        self.result_text = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD)
         self.result_text.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        # 添加水平滚动条
-        h_scrollbar = ttk.Scrollbar(main_frame, orient=tk.HORIZONTAL, command=self.result_text.xview)
-        h_scrollbar.pack(fill=tk.X)
-        self.result_text.configure(xscrollcommand=h_scrollbar.set)
+        # 注意：已移除水平滚动条，因为 wrap=tk.WORD 会自动换行
     
     def _bind_events(self):
         """绑定事件"""
         self.tag_entry.bind('<Return>', lambda e: self._search_by_tag())
         self.pic_id_entry.bind('<Return>', lambda e: self._search_by_pic_id())
+        self.filename_entry.bind('<Return>', lambda e: self._search_by_filename())
         self.tags_entry.bind('<Return>', lambda e: self._search_by_tags())
         self.row_number_entry.bind('<Return>', lambda e: self._update_row_number())
     
@@ -262,10 +289,27 @@ class DBQueryGUI:
         """显示所有表名"""
         if not self._check_db():
             return
+        
         try:
             tables = self.db.get_all_tables()
             self._clear_results()
             self._append_message(f"数据库中的表 ({len(tables)} 个):\n" + "\n".join(f"  - {t}" for t in tables))
+        except Exception as e:
+            self._append_message(f"❌ 查询失败: {e}")
+    
+    def _show_all_tags(self):
+        """显示所有唯一的tag_name"""
+        if not self._check_db():
+            return
+        
+        try:
+            tags = self.db.get_all_tags()
+            self._clear_results()
+            if tags:
+                tags_str = ", ".join(tags)
+                self._append_message(f"数据库中的所有tag ({len(tags)} 个):\n\n{tags_str}")
+            else:
+                self._append_message("数据库中没有任何tag记录")
         except Exception as e:
             self._append_message(f"❌ 查询失败: {e}")
     
@@ -289,10 +333,22 @@ class DBQueryGUI:
         tag = self.tag_entry.get().strip()
         self._execute_query(self.db.get_pictures_by_tag, tag, "Tag", "请输入tag名称")
     
+    def _clear_input_fields(self):
+        """清空所有输入框"""
+        self.tag_entry.delete(0, tk.END)
+        self.pic_id_entry.delete(0, tk.END)
+        self.filename_entry.delete(0, tk.END)
+        self.tags_entry.delete(0, tk.END)
+    
     def _search_by_pic_id(self):
         """根据图片ID查询"""
         pic_id = self.pic_id_entry.get().strip()
         self._execute_query(self.db.get_tag_by_pic_id, pic_id, "图片ID", "请输入图片ID")
+    
+    def _search_by_filename(self):
+        """根据文件名查询"""
+        filename = self.filename_entry.get().strip()
+        self._execute_query(self.db.get_tag_by_filename, filename, "文件名", "请输入文件名")
     
     def _search_by_tags(self):
         """根据tags搜索"""
