@@ -795,7 +795,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
     # 检查过期标签
     downloader._check_expire()
     
-    downloader.log(f'End({offset}) tags:{processed_count} done:{len(done_tags)}')
+    downloader.log(f'End({offset}) tags:{processed_count}')
     downloader.log('End')
     
     # 收集完成的tag列表和中断标志
@@ -841,7 +841,7 @@ def update_batch_mode6_queue(task_queue, offset):
     while True:
         # 先检查自己的启动文件（在取任务前检查，快速响应中断）
         if not downloader._chk_start():
-            downloader.log(f'Start file deleted, exiting...')
+            #downloader.log(f'Start file deleted, exiting...')
             interrupted = True
             break
         
@@ -857,7 +857,7 @@ def update_batch_mode6_queue(task_queue, offset):
                 
                 # 检查启动文件（支持中断）- 在处理任务时再次检查
                 if not downloader._chk_start():
-                    downloader.log(f'Interrupted at tag: {tag}')
+                    #downloader.log(f'Interrupted at tag: {tag}')
                     task_queue.task_done()
                     interrupted = True
                     break
