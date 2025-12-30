@@ -321,7 +321,7 @@ class Downloader:
                     self.result['status_updates'][tag] = {'status': 1, 'config': self.tag_config.copy()}
                     break
                 
-                if i < tag_config['start_pic']:
+                if page == tag_config['startpage'] and i < tag_config['start_pic']:
                     continue
                 
                 if img_id in self.expic:
