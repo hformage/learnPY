@@ -18,7 +18,6 @@ import datetime
 import glob
 from operator import itemgetter
 import set_tag
-from set_tag import writefile, readfile
 from downloader import down_single, down_batch_mode3_queue
 from core import config, get_database, load_tag_mapping, format_size
 
@@ -88,7 +87,8 @@ def write_tag_time(tag_time_dict):
                     continue
                 parts = line.split(': ', 1)
                 if len(parts) != 2:
-                    continue# 解析时间（支持新旧格式）
+                    continue
+ # 解析时间（支持新旧格式）
                 if '|time1:' in line:
                     # 新格式: |time1: xxx|time2: xxx|time3: xxx|time4: xxx
                     # 一次性解析完成
@@ -212,94 +212,156 @@ def handle_result(result):
         for file_info in result['downloaded_files']:
             db.add_picture(file_info)
     
-    # 3. 下载完成，删除数据库进度记录
+    # 3. 更新进度状态（中断恢复用）
+    if result.get('status_updates'):
+        for tag, update_info in result['status_updates'].items():
+            set_tag.update_tagjson(tag, update_info['config'])
+    
+    # 4. 下载完成，删除数据库进度记录
     if result.get('delete_tag'):
         set_tag.delete_tagjson(result['tag'])
     
-    # 4. 设置为完成
+    # 5. 设置为完成
     if result.get('set_input_done'):
         set_tag.set_input_done(result['set_input_done'])
     
-    # 5. 删除启动文件
+    # 6. 删除启动文件
     if result.get('remove_startfile') and os.path.exists(result.get('remove_startfile')):
         os.remove(result['remove_startfile'])
     
-    # 6. 添加过期tag
+    # 7. 添加过期tag
     if result.get('expire_tags'):
-        for expire_tag in result['expire_tags']:
+       for expire_tag in result['expire_tags']:
             set_tag.add_expire_tag(expire_tag)
     
     # 注意：缩略图已在downloader中异步提交，此处无需处理
 
-def _run_download_mode(status_filter, mode_name):
+
+def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_tag_time=False):
     """
-    通用下载模式（mode 1/2 公共逻辑）
+    通用批量队列处理模式（Mode 3/6/7 公共逻辑）
     
     Args:
-        status_filter: 状态过滤器（list）
         mode_name: 模式名称（用于日志）
-    """
-    from core import get_database
+        worker_func: 工作函数 (task_queue, offset) -> result
+        result_handler: 可选的结果处理函数 (result, stats_collector) -> None
+        collect_tag_time: 是否收集 tag_time（Mode 3需要）
     
+    Returns:
+        dict: 汇总统计结果
+    """
     try:
-        # 初始化
+        print(f"\n=== {mode_name} ===\n")
+        
+        # 1. 初始化标签列表
         set_tag.add_folder_tag()
-        set_tag.init_input()
+        set_tag.init_input(1)
+        set_tag.add_dead_tag()
+        taglist = set_tag.read_tags()
         
-        tags_config = set_tag.read_tagjson()
+        if not taglist:
+            print("没有可处理的标签")
+            return {}
         
-        # 筛选任务
-        tasks = [(tag, info) for tag, info in tags_config.items() 
-                 if info['status'] in status_filter]
+        print(f"总标签数: {len(taglist)}")
         
-        if not tasks:
-            print(f"没有需要{mode_name}的标签")
-            return
+        # 2. 检查运行中的任务
+        end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
+        running = len(end_files)
+        workers = 6
         
-        print(f"准备{mode_name} {len(tasks)} 个标签")
+        if running >= workers:
+            print(f"已有{running}个任务运行中，无法启动新任务")
+            return {}
         
-        # 使用6线程并发下载
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {executor.submit(down_single, tag, tag_config): tag 
-                      for tag, tag_config in tasks}
+        # 3. 计算可用线程数
+        available = workers - running
+        print(f"运行中任务: {running}, 可用线程: {available}/{workers}")
+        
+        # 4. 创建任务队列并填充
+        task_queue = queue.Queue()
+        for tag in taglist:
+            task_queue.put(tag)
+        
+        # 5. 添加结束标记
+        for _ in range(available):
+            task_queue.put(None)
+        
+        print(f"任务队列已创建: {len(taglist)} 个tag\n")
+        
+        # 6. 数据收集
+        stats_collector = {
+            'all_tag_time': {},
+            'all_done_tags': [],
+            'total_downloaded': 0,
+            'total_failed': 0,
+            'total_size': 0,
+            'total_added': 0,
+            'total_updated': 0,
+            'total_skipped': 0,
+            'total_not_found': 0,
+        }
+        
+        start_time = time.time()
+        
+        # 7. 启动工作线程
+        with concurrent.futures.ThreadPoolExecutor(max_workers=available) as executor:
+            futures = {executor.submit(worker_func, task_queue, i+1): i+1 
+                      for i in range(available)}
             
-            # 收集所有结果
-            all_tag_time = {}
-            total_downloaded = 0
-            total_failed = 0
-            total_size = 0
-            
+            # 8. 收集结果
             for future in concurrent.futures.as_completed(futures):
-                tag = futures[future]
+                offset = futures[future]
                 try:
                     result = future.result()
                     
-                    # 统一处理结果（主线程写入）
-                    handle_result(result)
+                    # 通用结果处理
+                    if result_handler:
+                        result_handler(result, stats_collector)
+                    else:
+                        handle_result(result)
                     
-                    # 合并tag_time
-                    if result.get('tag_time'):
-                        all_tag_time.update(result['tag_time'])
+                    # 合并tag_time（Mode 3）
+                    if collect_tag_time and result.get('tag_time'):
+                        stats_collector['all_tag_time'].update(result['tag_time'])
+                    
+                    if result.get('done_tags'):
+                        stats_collector['all_done_tags'].extend(result['done_tags'])
                     
                     # 收集统计数据
                     stats = result.get('statistics', {})
-                    total_downloaded += stats.get('downloaded', 0)
-                    total_failed += stats.get('failed', 0)
-                    total_size += stats.get('total_size', 0)
+                    stats_collector['total_downloaded'] += stats.get('downloaded', 0)
+                    stats_collector['total_failed'] += stats.get('failed', 0)
+                    stats_collector['total_size'] += stats.get('total_size', 0)
+                    stats_collector['total_added'] += stats.get('added', 0)
+                    stats_collector['total_updated'] += stats.get('updated', 0)
+                    stats_collector['total_skipped'] += stats.get('skipped', 0)
+                    stats_collector['total_not_found'] += stats.get('not_found', 0)
                     
-                    print(f"✓ {tag} 完成")
+                    done_count = result.get('processed_count', len(result.get('done_tags', [])))
+                    interrupted_msg = " (interrupted)" if result.get('interrupted') else ""
+                    print(f"✓ 线程{offset} 完成: {done_count} 个tag{interrupted_msg}")
+                    
                 except Exception as e:
-                    print(f"✗ {tag} 出错: {e}")
-            
-            # 最后统一写入tag_time
-            if all_tag_time:
-                write_tag_time(all_tag_time)
-            
-            # 打印汇总统计
-            print_summary_statistics(total_downloaded, total_failed, total_size)
-    
+                    print(f"✗ 线程{offset} 出错: {e}")
+        
+        # 9. 清空队列中可能残留的任务
+        remaining = 0
+        while not task_queue.empty():
+            try:
+                task_queue.get_nowait()
+                remaining += 1
+            except:
+                break
+        if remaining > 0:
+            print(f"⚠ 清理了 {remaining} 个未处理的队列任务")
+        
+        stats_collector['elapsed_minutes'] = (time.time() - start_time) / 60
+        stats_collector['total_tags'] = len(taglist)
+        
+        return stats_collector
+        
     finally:
-        # 关闭数据库连接
         try:
             get_database().close_all_connections()
         except Exception as e:
@@ -442,8 +504,7 @@ def mode_1():
                     task_queue.put((new_tag, new_config))
                     processed_tags.add(new_tag)
                     print(f"🆕 发现新标签: {new_tag}")
-                
-        # 补充新任务到线程池（保持6个并发）
+          # 补充新任务到线程池（保持6个并发）
                 while not task_queue.empty() and len(active_futures) < 6:
                     tag, tag_config = task_queue.get()
                     future = executor.submit(down_single, tag, tag_config)
@@ -533,155 +594,60 @@ def _scan_new_tags(processed_tags):
 def mode_3():
     """模式3: 下载所有旧标签（队列模式 - 动态负载均衡）"""
     
-    try:
-        print("\n=== Mode 3: Download All Old Tags ===\n")
-        
-        # 1. 初始化标签列表
-        set_tag.add_folder_tag()
-        set_tag.init_input(1)
-        set_tag.add_dead_tag()
-        taglist = set_tag.read_tags()
-        
-        if not taglist:
-            print("没有可下载的标签")
-            return
-        
-        print(f"总标签数: {len(taglist)}")
-        
-        # 2. 检查运行中的任务
-        end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
-        running = len(end_files)
-        workers = 6
-        
-        if running >= workers:
-            print(f"已有{running}个任务运行中，无法启动新任务")
-            return
-        
-        # 3. 计算可用线程数
-        available = workers - running
-        print(f"运行中任务: {running}, 可用线程: {available}/{workers}")
-        
-        # 4. 创建任务队列并填充
-        task_queue = queue.Queue()
-        for tag in taglist:
-            task_queue.put(tag)
-        
-        # 5. 添加结束标记（每个线程一个None）
-        for _ in range(available):
-            task_queue.put(None)
-        
-        print(f"任务队列已创建: {len(taglist)} 个tag\n")
-        
-        # 6. 数据收集变量
-        all_tag_time = {}
-        all_done_tags = []
-        total_downloaded = 0
-        total_failed = 0
-        total_size = 0
-        
-        start_time = time.time()
-        
-        # 7. 启动工作线程
-        with concurrent.futures.ThreadPoolExecutor(max_workers=available) as executor:
-            futures = {executor.submit(down_batch_mode3_queue, task_queue, i+1): i+1 
-                      for i in range(available)}
-            
-            # 8. 收集结果（每个线程独立，删除对应.start只停止对应线程）
-            for future in concurrent.futures.as_completed(futures):
-                offset = futures[future]
-                try:
-                    result = future.result()
-                    
-                    # 统一处理结果
-                    handle_result(result)
-                    
-                    # 合并数据
-                    if result.get('tag_time'):
-                        all_tag_time.update(result['tag_time'])
-                    
-                    if result.get('done_tags'):
-                        all_done_tags.extend(result['done_tags'])
-                    
-                    # 收集统计数据
-                    stats = result.get('statistics', {})
-                    total_downloaded += stats.get('downloaded', 0)
-                    total_failed += stats.get('failed', 0)
-                    total_size += stats.get('total_size', 0)
-                    
-                    done_count = len(result.get('done_tags', []))
-                    interrupted_msg = " (interrupted)" if result.get('interrupted') else ""
-                    print(f"✓ 线程{offset} 完成: {done_count} 个tag{interrupted_msg}")
-                    
-                except Exception as e:
-                    print(f"✗ 线程{offset} 出错: {e}")
-        
-        # 9. 清空队列中可能残留的任务（线程已全部退出，直接清理）
-        remaining = 0
-        while not task_queue.empty():
-            try:
-                task_queue.get_nowait()
-                remaining += 1
-            except:
-                break
-        if remaining > 0:
-            print(f"⚠ 清理了 {remaining} 个未处理的队列任务")
-        
-        elapsed_minutes = (time.time() - start_time) / 60
-        
-        # 10. 统一写入（主线程）
-        if all_tag_time:
-            write_tag_time(all_tag_time)
-            print(f"\n已更新 {len(all_tag_time)} 个tag到 downtag.txt")
-        
-        if all_done_tags:
-            set_tag.add_tags(all_done_tags)
-            print(f"已添加 {len(all_done_tags)} 个tag到 tags.txt")
-        
-        # 11. 输出汇总日志（仅打印到控制台）
-        def print_summary_log(msg):
-            current_time = time.strftime('%Y-%m-%d %H:%M:%S')
-            formatted_msg = f"{current_time} | {msg}"
-            print(formatted_msg)
-        
-        if total_downloaded > 0:
-            if total_size < 1024 * 1024:
-                total_size_str = f"{total_size / 1024:.2f} Kb"
-                avg_size_str = f"{total_size / total_downloaded / 1024:.2f} Kb"
-            elif total_size < 1024 * 1024 * 1024:
-                total_size_str = f"{total_size / 1024 / 1024:.2f} Mb"
-                avg_size_str = f"{total_size / total_downloaded / 1024 / 1024:.2f} Mb"
-            else:
-                total_size_str = f"{total_size / 1024 / 1024 / 1024:.2f} Gb"
-                avg_size_str = f"{total_size / total_downloaded / 1024 / 1024:.2f} Mb"
-            print_summary_log(f'Total size: {total_size_str}  avg size: {avg_size_str}')
-            print_summary_log(f'Total download: {total_downloaded} failed: {total_failed}')
-        
-        # 输出 expired tag 统计
-        nulltag_count = 0
-        nulltag_path = config['path'].get('nulltag', config['path'].get('deadtag'))
-        if nulltag_path and os.path.exists(nulltag_path):
-            with open(nulltag_path, 'r') as fd:
-                nulltag_count = sum(1 for _ in fd)
-        print_summary_log(f'expired tag: {nulltag_count}')
-        
-        print_summary_log(f'End tags:{len(all_done_tags)}')
-        print_summary_log('End')
-        
-        # 12. 输出汇总统计（控制台）
-        print(f"\n{'='*50}")
-        print(f"  总耗时: {elapsed_minutes:.1f} 分钟")
-        print(f"  已处理: {len(all_done_tags)}/{len(taglist)} 个tag")
-        print(f"  下载数量: {total_downloaded}  失败: {total_failed}")
-        if total_downloaded > 0:
-            print(f"  下载大小: {total_size_str}")
-        print(f"{'='*50}\n")
+    stats = _run_batch_queue_mode(
+        mode_name="Mode 3: Download All Old Tags",
+        worker_func=down_batch_mode3_queue,
+        result_handler=lambda r, s: handle_result(r),
+        collect_tag_time=True
+    )
     
-    finally:
-        # 关闭数据库连接
-        try:
-            get_database().close_all_connections()
-        except Exception as e:
-            print(f"⚠️  关闭数据库连接失败: {e}")
+    if not stats:
+        return
+    
+    # Mode 3 特有: 统一写入 tag_time 和 done_tags
+    if stats['all_tag_time']:
+        write_tag_time(stats['all_tag_time'])
+        print(f"\n已更新 {len(stats['all_tag_time'])} 个tag到 downtag.txt")
+    
+    if stats['all_done_tags']:
+        set_tag.add_tags(stats['all_done_tags'])
+        print(f"已添加 {len(stats['all_done_tags'])} 个tag到 tags.txt")
+    
+    # 输出汇总日志
+    def print_summary_log(msg):
+        current_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"{current_time} | {msg}")
+    
+    total_downloaded = stats['total_downloaded']
+    total_failed = stats['total_failed']
+    total_size = stats['total_size']
+    
+    total_size_str = ""
+    if total_downloaded > 0:
+        total_size_str = format_size(total_size)
+        avg_size_str = format_size(total_size // total_downloaded)
+        print_summary_log(f'Total size: {total_size_str}  avg size: {avg_size_str}')
+        print_summary_log(f'Total download: {total_downloaded} failed: {total_failed}')
+    
+    # 输出 expired tag 统计
+    nulltag_count = 0
+    nulltag_path = config['path'].get('nulltag', config['path'].get('deadtag'))
+    if nulltag_path and os.path.exists(nulltag_path):
+        with open(nulltag_path, 'r') as fd:
+            nulltag_count = sum(1 for _ in fd)
+    print_summary_log(f'expired tag: {nulltag_count}')
+    
+    print_summary_log(f'End tags:{len(stats["all_done_tags"])}')
+    print_summary_log('End')
+    
+    # 输出汇总统计
+    print(f"\n{'='*50}")
+    print(f"  总耗时: {stats['elapsed_minutes']:.1f} 分钟")
+    print(f"  已处理: {len(stats['all_done_tags'])}/{stats['total_tags']} 个tag")
+    print(f"  下载数量: {total_downloaded}  失败: {total_failed}")
+    if total_downloaded > 0:
+        print(f"  下载大小: {total_size_str}")
+    print(f"{'='*50}\n")
 
 
 def mode_4():
@@ -743,113 +709,54 @@ def mode_6():
     """模式6: 更新图片信息（Mode 3变种，不下载只更新DB）"""
     from downloader import update_batch_mode6_queue
     
-    try:
-        print("\n=== Mode 6: 更新图片信息 ===\n")
-        
-        # 1. 初始化标签列表（与Mode 3相同）
-        set_tag.add_folder_tag()
-        set_tag.init_input(1)
-        set_tag.add_dead_tag()
-        taglist = set_tag.read_tags()
-        
-        if not taglist:
-            print("没有可处理的标签")
-            return
-        
-        print(f"总标签数: {len(taglist)}")
-        
-        # 2. 检查运行中的任务
-        end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
-        running = len(end_files)
-        workers = 6
-        
-        if running >= workers:
-            print(f"已有{running}个任务运行中，无法启动新任务")
-            return
-        
-        # 3. 计算可用线程数
-        available = workers - running
-        print(f"运行中任务: {running}, 可用线程: {available}/{workers}")
-        
-        # 4. 创建任务队列并填充
-        task_queue = queue.Queue()
-        for tag in taglist:
-            task_queue.put(tag)
-        
-        # 5. 添加结束标记
-        for _ in range(available):
-            task_queue.put(None)
-        
-        print(f"任务队列已创建: {len(taglist)} 个tag\n")
-        
-        # 6. 数据收集变量
-        total_added = 0
-        total_updated = 0
-        total_skipped = 0
-        
-        start_time = time.time()
-        
-        # 7. 启动工作线程
-        with concurrent.futures.ThreadPoolExecutor(max_workers=available) as executor:
-            futures = {executor.submit(update_batch_mode6_queue, task_queue, i+1): i+1 
-                      for i in range(available)}
-            
-            # 8. 收集结果（每个线程独立，删除对应.start只停止对应线程）
-            for future in concurrent.futures.as_completed(futures):
-                offset = futures[future]
-                try:
-                    result = future.result()
-                    
-                    # 收集统计数据
-                    stats = result.get('statistics', {})
-                    total_added += stats.get('added', 0)
-                    total_updated += stats.get('updated', 0)
-                    total_skipped += stats.get('skipped', 0)
-                    
-                    done_count = result.get('processed_count', 0)
-                    interrupted_msg = " (interrupted)" if result.get('interrupted') else ""
-                    print(f"✓ 线程{offset} 完成: {done_count} 个tag{interrupted_msg}")
-                    
-                except Exception as e:
-                    print(f"✗ 线程{offset} 出错: {e}")
-        
-        # 9. 清空队列中可能残留的任务（线程已全部退出，直接清理）
-        remaining = 0
-        while not task_queue.empty():
-            try:
-                task_queue.get_nowait()
-                remaining += 1
-            except:
-                break
-        if remaining > 0:
-            print(f"⚠ 清理了 {remaining} 个未处理的队列任务")
-        
-        elapsed_minutes = (time.time() - start_time) / 60
-        
-        # 10. 输出汇总统计
-        print(f"\n{'='*50}")
-        print(f"  总耗时: {elapsed_minutes:.1f} 分钟")
-        print(f"  新增记录: {total_added}")
-        print(f"  更新记录: {total_updated}")
-        print(f"  跳过(本地无文件): {total_skipped}")
-        print(f"{'='*50}\n")
-        
-    finally:
-        try:
-            get_database().close_all_connections()
-        except Exception as e:
-            print(f"⚠️  关闭数据库连接失败: {e}")
+    stats = _run_batch_queue_mode(
+        mode_name="Mode 6: 更新图片信息",
+        worker_func=update_batch_mode6_queue
+    )
+    
+    if not stats:
+        return
+    
+    # 输出汇总统计
+    print(f"\n{'='*50}")
+    print(f"  总耗时: {stats['elapsed_minutes']:.1f} 分钟")
+    print(f"  新增记录: {stats['total_added']}")
+    print(f"  更新记录: {stats['total_updated']}")
+    print(f"  跳过(本地无文件): {stats['total_skipped']}")
+    print(f"{'='*50}\n")
+
+
+def mode_7():
+    """模式7: 从本地tags.txt导入图片信息到DB（不联网）"""
+    from downloader import update_batch_mode7_queue
+    
+    stats = _run_batch_queue_mode(
+        mode_name="Mode 7: 从本地tags.txt导入图片信息",
+        worker_func=update_batch_mode7_queue
+    )
+    
+    if not stats:
+        return
+    
+    # 输出汇总统计
+    print(f"\n{'='*50}")
+    print(f"  总耗时: {stats['elapsed_minutes']:.1f} 分钟")
+    print(f"  新增记录: {stats['total_added']}")
+    print(f"  跳过(已存在): {stats['total_skipped']}")
+    print(f"  未找到(无tags.txt): {stats['total_not_found']}")
+    print(f"{'='*50}\n")
 
 
 def main():
     """主函数"""
     if len(sys.argv) < 2:
-        print("使用方法: python main.py [1|3|4|5|6]")
+        print("使用方法: python main.py [1|3|4|5|6|7]")
         print("  1 - 下载新标签（自动恢复中断）")
         print("  3 - 下载所有旧标签")
         print("  4 - 清理已完成记录")
         print("  5 old_tag new_tag - 修改图片tag_name")
-        print("  6 - 更新图片信息（不下载）")
+        print("  6 - 更新图片信息（不下载，联网获取）")
+        print("  7 - 从本地tags.txt导入图片信息（不联网）")
         return
     
     mode = sys.argv[1]
@@ -868,9 +775,11 @@ def main():
             mode_5(sys.argv[2], sys.argv[3])
         elif mode == '6':
             mode_6()
+        elif mode == '7':
+            mode_7()
         else:
             print(f"未知模式: {mode}")
-            print("可用模式: 1, 3, 4, 5, 6")
+            print("可用模式: 1, 3, 4, 5, 6, 7")
     finally:
         print("\n所有任务完成")
 

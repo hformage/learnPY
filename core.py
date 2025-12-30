@@ -451,7 +451,7 @@ class DatabaseManager:
                     end_pic TEXT DEFAULT '0',
                     status INTEGER DEFAULT 0,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
@@ -704,6 +704,41 @@ class DatabaseManager:
             for row in cursor.fetchall():
                 result[row['filename']] = dict(row)
             return result
+    
+    def update_picture(self, pic_id: str, tag_name: str, update_data: Dict[str, Any]) -> bool:
+        """
+        更新图片记录（Mode 6专用，更新缺失的字段）
+        
+        Args:
+            pic_id: 图片ID
+            tag_name: 标签名
+            update_data: 要更新的字段
+        
+        Returns:
+            bool: 是否更新成功
+        """
+        if not update_data:
+            return False
+        
+        # 构建更新语句
+        set_clauses = []
+        values = []
+        for key, value in update_data.items():
+            if value is not None:  # 只更新非空值
+                set_clauses.append(f"{key}=?")
+                values.append(value)
+        
+        if not set_clauses:
+            return False
+        
+        values.extend([pic_id, tag_name])
+        
+        with self.get_cursor() as cursor:
+            cursor.execute(f"""
+                UPDATE pictures SET {', '.join(set_clauses)}
+                WHERE pic_id=? AND tag_name=?
+            """, values)
+            return cursor.rowcount > 0
     
     def close_all_connections(self):
         """关闭所有连接"""
