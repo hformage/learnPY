@@ -1,24 +1,25 @@
 """
-数据库查询工具 - Gelbooru图片元数据查询
+数据库查询工具 - Gelbooru图片元数据查询 (GUI版本)
 
 使用方法:
     python check_db_log.py
     
 功能:
     1. 根据tag查询该tag下所有图片
-    2. 根据图片文件名查询图片信息
-    3. 根据图片标签(pic_tags)搜索图片
-    4. 插入/更新/删除图片记录
+    2. 根据图片ID查询tag名字
+    3. 根据tags搜索图片
+    4. 自定义SQL查询
+    5. 显示所有表名
 
 说明:
     这是一个独立的数据库查询工具，不依赖项目的其他模块
     只需要访问数据库文件即可运行
 """
 
-import sys
 import os
 import sqlite3
-import threading
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
 from contextlib import contextmanager
 from typing import List, Dict, Optional
 
@@ -26,40 +27,28 @@ from typing import List, Dict, Optional
 # ==================== 独立的数据库管理器 ====================
 
 class DatabaseManager:
-    """线程安全的数据库管理器（查询工具专用）"""
+    """数据库管理器（非单例，支持动态切换路径）"""
     
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls, db_path: Optional[str] = None):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self, db_path: Optional[str] = None):
-        if self._initialized:
-            return
-        
-        if db_path is None:
-            db_path = r'F:\Pic\Gelbooru\new\gelbooru_metadata.db'
-        
+    def __init__(self, db_path: str):
         self.db_path = db_path
-        self._thread_local = threading.local()
-        self._initialized = True
+        self._connection = None
     
     def _get_connection(self) -> sqlite3.Connection:
-        """获取线程本地连接"""
-        if not hasattr(self._thread_local, 'connection'):
-            self._thread_local.connection = sqlite3.connect(
+        """获取数据库连接"""
+        if self._connection is None:
+            self._connection = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
                 timeout=30.0
             )
-            self._thread_local.connection.row_factory = sqlite3.Row
-        return self._thread_local.connection
+            self._connection.row_factory = sqlite3.Row
+        return self._connection
+    
+    def close(self):
+        """关闭连接"""
+        if self._connection:
+            self._connection.close()
+            self._connection = None
     
     @contextmanager
     def get_cursor(self):
@@ -75,391 +64,409 @@ class DatabaseManager:
         finally:
             cursor.close()
     
-    def get_pictures_by_tag(self, tag_name: str, limit: Optional[int] = None) -> List[Dict]:
+    def get_all_tables(self) -> List[str]:
+        """获取所有表名"""
+        with self.get_cursor() as cursor:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            return [row[0] for row in cursor.fetchall()]
+    
+    def get_pictures_by_tag(self, tag_name: str) -> List[Dict]:
         """获取标签下的所有图片"""
         with self.get_cursor() as cursor:
-            query = 'SELECT * FROM pictures WHERE tag_name=? ORDER BY pic_time DESC'
-            if limit:
-                query += f' LIMIT {limit}'
-            cursor.execute(query, (tag_name,))
+            cursor.execute('SELECT * FROM pictures WHERE tag_name=? ORDER BY pic_time DESC', (tag_name,))
             return [dict(row) for row in cursor.fetchall()]
     
-    def get_picture_by_filename(self, filename: str) -> Optional[Dict]:
-        """根据文件名查询图片信息"""
+    def get_tag_by_pic_id(self, pic_id: str) -> List[Dict]:
+        """根据图片ID查询tag信息"""
         with self.get_cursor() as cursor:
-            cursor.execute('SELECT * FROM pictures WHERE filename=? LIMIT 1', (filename,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+            cursor.execute('SELECT * FROM pictures WHERE pic_id=?', (pic_id,))
+            return [dict(row) for row in cursor.fetchall()]
     
-    def search_pictures_by_tags(self, tags: List[str], match_all: bool = False) -> List[Dict]:
-        """
-        根据标签搜索图片
-        
-        Args:
-            tags: 标签列表
-            match_all: True=必须包含所有标签，False=包含任意标签
-        """
+    def search_pictures_by_tags(self, tags: List[str]) -> List[Dict]:
+        """根据标签搜索图片（任意匹配）"""
         with self.get_cursor() as cursor:
-            if match_all:
-                conditions = ' AND '.join(['pic_tags LIKE ?' for _ in tags])
-            else:
-                conditions = ' OR '.join(['pic_tags LIKE ?' for _ in tags])
-            
+            conditions = ' OR '.join(['pic_tags LIKE ?' for _ in tags])
             params = [f'%{tag}%' for tag in tags]
             query = f'SELECT * FROM pictures WHERE {conditions} ORDER BY pic_time DESC'
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
     
-    def add_picture(self, pic_data: Dict) -> int:
-        """添加图片记录"""
+    def execute_sql(self, sql: str) -> tuple:
+        """执行自定义SQL，返回(columns, rows)"""
         with self.get_cursor() as cursor:
-            cursor.execute("""
-                INSERT OR REPLACE INTO pictures 
-                (pic_id, tag_name, filename, new_filename, file_path, 
-                 file_size, pic_url, pic_tags, pic_time, pic_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                pic_data['pic_id'],
-                pic_data['tag_name'],
-                pic_data['filename'],
-                pic_data.get('new_filename'),
-                pic_data['file_path'],
-                pic_data.get('file_size'),
-                pic_data.get('pic_url'),
-                pic_data.get('pic_tags'),
-                pic_data.get('pic_time'),
-                pic_data.get('pic_date')
-            ))
-            return cursor.lastrowid
+            cursor.execute(sql)
+            if cursor.description:
+                columns = [desc[0] for desc in cursor.description]
+                rows = [dict(row) for row in cursor.fetchall()]
+                return columns, rows
+            return [], []
 
 
-# ==================== 查询工具类 ====================
+# ==================== GUI 应用 ====================
 
-class DBQueryTool:
-    """数据库查询工具类"""
+class DBQueryGUI:
+    """数据库查询GUI"""
     
-    def __init__(self, db_path: Optional[str] = None):
-        """
-        初始化查询工具
-        
-        Args:
-            db_path: 数据库文件路径，默认为 F:\Pic\Gelbooru\new\gelbooru_metadata.db
-        """
-        self.db = DatabaseManager(db_path)
+    DEFAULT_DB_PATH = r'F:\Pic\Gelbooru\new\gelbooru_metadata.db'
     
-    def query_by_tag(self, tag_name: str, limit: Optional[int] = None):
-        """
-        1. 根据tag查询所有图片
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Gelbooru 数据库查询工具")
+        self.root.geometry("900x700")
+        self.root.minsize(700, 500)
         
-        Args:
-            tag_name: 标签名（如 'character_name'）
-            limit: 限制返回数量，None表示全部
- """
-        print(f"\n{'='*80}")
-        print(f"📂 查询标签: {tag_name}")
-        print(f"{'='*80}\n")
+        # 配置参数
+        self.separator_length = 30  # 分隔符长度
+        self.default_rows_per_page = 10  # 默认每页行数
+        self.max_value_length = 200  # 结果字段最大显示长度
         
-        pictures = self.db.get_pictures_by_tag(tag_name, limit)
+        self.db = None
+        self.current_results = []
+        self.current_index = 0
+        self.row_number = self.default_rows_per_page
         
-        if not pictures:
-            print(f"❌ 未找到标签 '{tag_name}' 下的图片")
-            return []
+        self._create_widgets()
+        self._bind_events()
         
-        print(f"✅ 共找到 {len(pictures)} 张图片\n")
-        
-        for idx, pic in enumerate(pictures, 1):
-            print(f"[{idx}] 图片信息:")
-            print(f"  📌 文件名: {pic['filename']}")
-            print(f"  📁 路径: {pic['file_path']}")
-            print(f"  🆔 图片ID: {pic['pic_id']}")
-            print(f"  📅 上传日期: {pic['pic_date']}")
-            print(f"  🕐 上传时间: {pic['pic_time']}")
-            print(f"  📊 文件大小: {self._format_size(pic['file_size'])}")
-            print(f"  🏷️  标签列表: {pic['pic_tags'][:100]}..." if len(pic.get('pic_tags', '')) > 100 else f"  🏷️  标签列表: {pic['pic_tags']}")
-            print()
-        
-        return pictures
+        # 初始化数据库连接
+        self.db_path_var.set(self.DEFAULT_DB_PATH)
+        self._connect_db()
     
-    def query_by_filename(self, filename: str):
-        """
-        2. 根据文件名查询图片信息
+    def _create_widgets(self):
+        """创建所有控件"""
+        # 主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-        Args:
-            filename: 文件名（如 'xxxxxx.jpg'）
-        """
-        print(f"\n{'='*80}")
-        print(f"🔍 查询文件: {filename}")
-        print(f"{'='*80}\n")
+        # ===== 数据库路径 =====
+        path_frame = ttk.Frame(main_frame)
+        path_frame.pack(fill=tk.X, pady=(0, 5))
         
-        pic = self.db.get_picture_by_filename(filename)
+        ttk.Label(path_frame, text="db_path:").pack(side=tk.LEFT)
+        self.db_path_var = tk.StringVar()
+        self.db_path_entry = ttk.Entry(path_frame, textvariable=self.db_path_var, width=80)
+        self.db_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text="连接", command=self._connect_db, width=8).pack(side=tk.LEFT)
         
-        if not pic:
-            print(f"❌ 未找到文件 '{filename}'")
-            return None
+        # 分割线
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
-        print("✅ 找到图片信息:\n")
-        print(f"  📂 所属标签: {pic['tag_name']}")
-        print(f"  📁 存储路径: {pic['file_path']}")
-        print(f"  🆔 图片ID: {pic['pic_id']}")
-        print(f"  📅 上传日期: {pic['pic_date']}")
-        print(f"  🕐 上传时间: {pic['pic_time']}")
-        print(f"  📊 文件大小: {self._format_size(pic['file_size'])}")
-        print(f"  🔗 原始URL: {pic['pic_url']}")
-        print(f"  🏷️  完整标签: {pic['pic_tags']}")
-        print()
+      # ===== 显示所有表名 =====
+        ttk.Button(main_frame, text="显示所有表名", command=self._show_tables).pack(anchor=tk.W)
         
-        return pic
+        # 分割线
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # ===== 查询区域 =====
+        query_frame = ttk.Frame(main_frame)
+        query_frame.pack(fill=tk.X, pady=5)
+        
+        # 查询tag下所有图片
+        row1 = ttk.Frame(query_frame)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="查询tag下所有图片:", width=20, anchor='w').pack(side=tk.LEFT)
+        self.tag_entry = ttk.Entry(row1, width=50)
+        self.tag_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(row1, text="Search", command=self._search_by_tag, width=10).pack(side=tk.LEFT)
+        
+        # 根据图片ID查询tag名字
+        row2 = ttk.Frame(query_frame)
+        row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="查询tag名字(图片ID):", width=20, anchor='w').pack(side=tk.LEFT)
+        self.pic_id_entry = ttk.Entry(row2, width=50)
+        self.pic_id_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(row2, text="Search", command=self._search_by_pic_id, width=10).pack(side=tk.LEFT)
+        
+        # 根据tags查找图片
+        row3 = ttk.Frame(query_frame)
+        row3.pack(fill=tk.X, pady=2)
+        ttk.Label(row3, text="根据tag查找图片:", width=20, anchor='w').pack(side=tk.LEFT)
+        self.tags_entry = ttk.Entry(row3, width=50)
+        self.tags_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(row3, text="Search", command=self._search_by_tags, width=10).pack(side=tk.LEFT)
+        ttk.Label(row3, text="(逗号分隔)", foreground="gray").pack(side=tk.LEFT, padx=5)
+        
+        # 分割线
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # ===== 自定义SQL =====
+        sql_header = ttk.Frame(main_frame)
+        sql_header.pack(fill=tk.X)
+        ttk.Label(sql_header, text="查询SQL:").pack(side=tk.LEFT)
+        ttk.Button(sql_header, text="Search", command=self._execute_sql).pack(side=tk.RIGHT)
+        
+        self.sql_text = scrolledtext.ScrolledText(main_frame, height=5, wrap=tk.WORD)
+        self.sql_text.pack(fill=tk.X, pady=5)
+        
+        # 分割线
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # ===== 结果控制 =====
+        result_control = ttk.Frame(main_frame)
+        result_control.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(result_control, text="结果:").pack(side=tk.LEFT)
+        ttk.Label(result_control, text="每页行数:").pack(side=tk.LEFT, padx=(10, 0))
+        self.row_number_var = tk.StringVar(value=str(self.default_rows_per_page))
+        self.row_number_entry = ttk.Entry(result_control, textvariable=self.row_number_var, width=5)
+        self.row_number_entry.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(result_control, text="下一页", command=self._next_page).pack(side=tk.LEFT, padx=5)
+        ttk.Button(result_control, text="所有结果", command=self._show_all).pack(side=tk.LEFT, padx=5)
+        
+        # Clear按钮（先pack，显示在最右边）
+        ttk.Button(result_control, text="Clear", command=self._clear_display).pack(side=tk.RIGHT, padx=5)
+        
+        # 结果统计（后pack，显示在Clear按钮左边）
+        self.result_label = ttk.Label(result_control, text="查询结果: 0/0")
+        self.result_label.pack(side=tk.RIGHT)
+        
+        # ===== 结果显示 =====
+        self.result_text = scrolledtext.ScrolledText(main_frame, wrap=tk.NONE)
+        self.result_text.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # 添加水平滚动条
+        h_scrollbar = ttk.Scrollbar(main_frame, orient=tk.HORIZONTAL, command=self.result_text.xview)
+        h_scrollbar.pack(fill=tk.X)
+        self.result_text.configure(xscrollcommand=h_scrollbar.set)
     
-    def query_by_pic_tags(self, tags: List[str], match_all: bool = False):
-        """
-        3. 根据图片标签(pic_tags)搜索图片
-        
-        Args:
-            tags: 标签列表，例如 ['tt aa', 't4'] 或 ['tag1', 'tag_2']
-            match_all: True=必须包含所有标签，False=包含任意标签
-        
-        示例:
-            旧代码中 pic_tags = "tag1, tag_2, tt aa, t4, tt5"
-            输入 ['tt aa', 't4'] 可以匹配到这张图片
-        """
-        print(f"\n{'='*80}")
-        print(f"🔎 搜索标签: {', '.join(tags)}")
-        print(f"   匹配模式: {'全部匹配' if match_all else '任意匹配'}")
-        print(f"{'='*80}\n")
-        
-        pictures = self.db.search_pictures_by_tags(tags, match_all)
-        
-        if not pictures:
-            print(f"❌ 未找到包含标签 {tags} 的图片")
-            return []
-        
-        print(f"✅ 共找到 {len(pictures)} 张图片\n")
-        
-        for idx, pic in enumerate(pictures, 1):
-            print(f"[{idx}] 图片信息:")
-            print(f"  📂 所属标签: {pic['tag_name']}")
-            print(f"  📌 文件名: {pic['filename']}")
-            print(f"  📁 路径: {pic['file_path']}")
-            print(f"  🆔 图片ID: {pic['pic_id']}")
-            print(f"  📅 日期: {pic['pic_date']}")
-            print(f"  🏷️  匹配标签: {pic['pic_tags'][:120]}..." if len(pic.get('pic_tags', '')) > 120 else f"  🏷️  标签: {pic['pic_tags']}")
-            print()
-        
-        return pictures
+    def _bind_events(self):
+        """绑定事件"""
+        self.tag_entry.bind('<Return>', lambda e: self._search_by_tag())
+        self.pic_id_entry.bind('<Return>', lambda e: self._search_by_pic_id())
+        self.tags_entry.bind('<Return>', lambda e: self._search_by_tags())
+        self.row_number_entry.bind('<Return>', lambda e: self._update_row_number())
     
-    def insert_picture(self, pic_data: Dict):
-        """
-        插入图片记录
+    def _connect_db(self):
+        """连接数据库"""
+        db_path = self.db_path_var.get().strip()
+        if not db_path:
+            messagebox.showerror("错误", "请输入数据库路径")
+            return
         
-        Args:
-            pic_data: 图片数据字典，必须包含:
-                - pic_id: 图片ID
-                - tag_name: 标签名
-                - filename: 文件名
-                - file_path: 文件路径
-                可选:
-                - file_size, pic_url, pic_tags, pic_time, pic_date, new_filename
-        """
+        if not os.path.exists(db_path):
+            messagebox.showerror("错误", f"数据库文件不存在: {db_path}")
+            return
+        
         try:
-            pic_id = self.db.add_picture(pic_data)
-            print(f"✅ 成功插入图片记录 (ID: {pic_id})")
-            return pic_id
+            if self.db:
+                self.db.close()
+            self.db = DatabaseManager(db_path)
+            # 测试连接
+            self.db.get_all_tables()
+            self._show_message(f"✓ 数据库连接成功: {db_path}")
         except Exception as e:
-            print(f"❌ 插入失败: {e}")
-            return None
+            messagebox.showerror("错误", f"连接失败: {e}")
     
-    def update_picture(self, pic_id: str, tag_name: str, updates: Dict):
-        """
-        更新图片记录（通过删除后插入实现）
-        
-        Args:
-            pic_id: 图片ID
-            tag_name: 标签名
-            updates: 要更新的字段字典
-        """
-        print(f"⚠️  当前数据库使用 INSERT OR REPLACE 策略")
-        print(f"   建议使用 insert_picture() 方法，会自动覆盖已存在的记录")
+    def _show_tables(self):
+        """显示所有表名"""
+        if not self._check_db():
+            return
+        try:
+            tables = self.db.get_all_tables()
+            self._clear_results()
+            self._append_message(f"数据库中的表 ({len(tables)} 个):\n" + "\n".join(f"  - {t}" for t in tables))
+        except Exception as e:
+            self._append_message(f"❌ 查询失败: {e}")
     
-    def delete_picture(self, pic_id: str, tag_name: str):
-        """
-        删除图片记录
+    def _execute_query(self, query_func, input_value, title_prefix, error_msg="请输入查询内容"):
+        """通用查询执行方法"""
+        if not self._check_db():
+            return
         
-        Args:
-            pic_id: 图片ID
-            tag_name: 标签名
-        """
-        with self.db.get_cursor() as cursor:
-            cursor.execute(
-                'DELETE FROM pictures WHERE pic_id=? AND tag_name=?',
-                (pic_id, tag_name)
-            )
-            if cursor.rowcount > 0:
-                print(f"✅ 成功删除图片记录 (ID: {pic_id}, Tag: {tag_name})")
+        if not input_value:
+            messagebox.showwarning("提示", error_msg)
+            return
+        
+        try:
+            results = query_func(input_value)
+            self._display_results(results, f"{title_prefix}: {input_value}")
+        except Exception as e:
+            self._append_message(f"❌ 查询失败: {e}")
+    
+    def _search_by_tag(self):
+        """根据tag查询"""
+        tag = self.tag_entry.get().strip()
+        self._execute_query(self.db.get_pictures_by_tag, tag, "Tag", "请输入tag名称")
+    
+    def _search_by_pic_id(self):
+        """根据图片ID查询"""
+        pic_id = self.pic_id_entry.get().strip()
+        self._execute_query(self.db.get_tag_by_pic_id, pic_id, "图片ID", "请输入图片ID")
+    
+    def _search_by_tags(self):
+        """根据tags搜索"""
+        tags_input = self.tags_entry.get().strip()
+        if not tags_input:
+            messagebox.showwarning("提示", "请输入标签")
+            return
+        
+        # 处理输入：替换中文逗号，去除空格
+        tags_input = tags_input.replace('，', ',').replace('、', ',')
+        tags = [t.strip() for t in tags_input.split(',') if t.strip()]
+        
+        if not tags:
+            messagebox.showwarning("提示", "请输入有效的标签")
+            return
+        
+        if not self._check_db():
+            return
+        
+        try:
+            results = self.db.search_pictures_by_tags(tags)
+            self._display_results(results, f"Tags: {', '.join(tags)}")
+        except Exception as e:
+            self._append_message(f"❌ 查询失败: {e}")
+    
+    def _execute_sql(self):
+        """执行自定义SQL"""
+        if not self._check_db():
+            return
+        
+        sql = self.sql_text.get("1.0", tk.END).strip()
+        if not sql:
+            messagebox.showwarning("提示", "请输入SQL语句")
+            return
+        
+        try:
+            columns, results = self.db.execute_sql(sql)
+            if results:
+                self._display_results(results, f"SQL查询")
             else:
-                print(f"❌ 未找到该记录")
+                self._append_message("✓ SQL执行成功，无返回数据")
+        except Exception as e:
+            self._append_message(f"❌ SQL执行失败: {e}")
     
-    def get_statistics(self):
-        """获取数据库统计信息"""
-        print(f"\n{'='*80}")
-        print(f"📊 数据库统计")
-        print(f"{'='*80}\n")
-        
-        with self.db.get_cursor() as cursor:
-            # 总图片数
-            cursor.execute('SELECT COUNT(*) as cnt FROM pictures')
-            total_pics = cursor.fetchone()['cnt']
-            
-            # 总标签数
-            cursor.execute('SELECT COUNT(DISTINCT tag_name) as cnt FROM pictures')
-            total_tags = cursor.fetchone()['cnt']
-            
-            # 总文件大小
-            cursor.execute('SELECT SUM(file_size) as total FROM pictures')
-            total_size = cursor.fetchone()['total'] or 0
-            
-            # 失败记录数
-            cursor.execute('SELECT COUNT(*) as cnt FROM failed_downloads')
-            failed_cnt = cursor.fetchone()['cnt']
-            
-            print(f"  📷 总图片数: {total_pics}")
-            print(f"  🏷️  总标签数: {total_tags}")
-            print(f"  📊 总大小: {self._format_size(total_size)}")
-            print(f"  ❌ 失败记录: {failed_cnt}")
-            print()
+    def _check_db(self):
+        """检查数据库连接"""
+        if not self.db:
+            messagebox.showwarning("提示", "请先连接数据库")
+            return False
+        return True
     
-    def list_all_tags(self):
-        """列出所有标签"""
-        with self.db.get_cursor() as cursor:
-            cursor.execute("""
-                SELECT tag_name, COUNT(*) as pic_count, SUM(file_size) as total_size
-                FROM pictures 
-                GROUP BY tag_name 
-                ORDER BY pic_count DESC
-            """)
-            tags = cursor.fetchall()
-        
-        print(f"\n{'='*80}")
-        print(f"📋 所有标签列表 (共 {len(tags)} 个)")
-        print(f"{'='*80}\n")
-        
-        for idx, tag in enumerate(tags, 1):
-            print(f"[{idx:3}] {tag['tag_name']:<30} | 图片: {tag['pic_count']:>5} 张 | 大小: {self._format_size(tag['total_size'])}")
+    def _clear_results(self):
+        """清空分页状态（不清除显示）"""
+        self.current_results = []
+        self.current_index = 0
+        self.result_label.config(text="查询结果: 0/0")
     
-    @staticmethod
-    def _format_size(size_bytes: int) -> str:
-        """格式化文件大小"""
-        if not size_bytes:
-            return "0 B"
-        if size_bytes < 1024:
-            return f"{size_bytes} B"
-        elif size_bytes < 1024 * 1024:
-            return f"{size_bytes / 1024:.2f} KB"
-        elif size_bytes < 1024 * 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024:.2f} MB"
-        else:
-            return f"{size_bytes / 1024 / 1024 / 1024:.2f} GB"
-
-
-def print_menu():
-    """打印菜单"""
-    print("\n" + "="*80)
-    print("  Gelbooru 数据库查询工具 v1.0")
-    print("="*80)
-    print("\n  查询功能:")
-    print("    1. 根据tag查询图片")
-    print("    2. 根据文件名查询")
-    print("    3. 根据图片标签搜索")
-    print("    4. 列出所有标签")
-    print("    5. 数据库统计")
-    print("\n  管理功能:")
-    print("    6. 插入图片记录")
-    print("    7. 删除图片记录")
-    print("\n    0. 退出")
-    print("="*80)
+    def _clear_display(self):
+        """清空结果显示框"""
+        self.result_text.delete("1.0", tk.END)
+        self.current_results = []
+        self.current_index = 0
+        self.result_label.config(text="查询结果: 0/0")
+    
+    def _show_message(self, msg):
+        """显示消息（覆盖模式，用于连接成功等提示）"""
+        self.result_text.delete("1.0", tk.END)
+        self.result_text.insert(tk.END, msg)
+    
+    def _append_message(self, msg):
+        """追加消息（不清除原有内容）"""
+        if self.result_text.get("1.0", tk.END).strip():
+            separator = "-" * self.separator_length
+            self.result_text.insert(tk.END, f"\n\n{separator}\n\n")
+        self.result_text.insert(tk.END, msg)
+        self.result_text.see(tk.END)
+    
+    def _update_row_number(self):
+        """更新每页行数"""
+        try:
+            self.row_number = int(self.row_number_var.get())
+            if self.row_number < 1:
+                self.row_number = self.default_rows_per_page
+                self.row_number_var.set(str(self.default_rows_per_page))
+        except ValueError:
+            self.row_number = self.default_rows_per_page
+            self.row_number_var.set(str(self.default_rows_per_page))
+    
+    def _format_row(self, row_data: Dict) -> str:
+        """格式化单行数据为字符串"""
+        lines = []
+        for key, value in row_data.items():
+            str_value = str(value) if value is not None else "NULL"
+            if len(str_value) > self.max_value_length:
+                str_value = str_value[:self.max_value_length] + "..."
+            lines.append(f"  {key}: {str_value}")
+        return "\n".join(lines)
+    
+    def _display_results(self, results, title=""):
+        """显示查询结果（追加模式）"""
+        self._update_row_number()
+        self.current_results = results
+        self.current_index = 0
+        
+        if not results:
+            self._append_message(f"{title}\n\n❌ 未找到任何记录")
+            self.result_label.config(text="查询结果: 0/0")
+            return
+        
+        self._show_current_page(title)
+    
+    def _show_current_page(self, title=""):
+        """显示当前页（追加模式）"""
+        total = len(self.current_results)
+        start = self.current_index
+        end = min(start + self.row_number, total)
+        
+        # 如果已有内容，先添加分隔
+        if self.result_text.get("1.0", tk.END).strip():
+            separator = "-" * self.separator_length
+            self.result_text.insert(tk.END, f"\n\n{separator}\n\n")
+        
+        # 显示标题和统计
+        if title:
+            self.result_text.insert(tk.END, f"=== {title} ===\n\n")
+        
+        # 显示当前页数据
+        for i, row in enumerate(self.current_results[start:end], start + 1):
+            self.result_text.insert(tk.END, f"[{i}] ----------------------------------------\n")
+            self.result_text.insert(tk.END, self._format_row(row) + "\n\n")
+        
+        self.result_label.config(text=f"查询结果: {end}/{total}")
+        self.result_text.see(tk.END)
+    
+    def _next_page(self):
+        """下一页"""
+        if not self.current_results:
+            return
+        
+        self._update_row_number()
+        total = len(self.current_results)
+        
+        if self.current_index + self.row_number < total:
+            self.current_index += self.row_number
+            self._show_current_page()
+    
+    def _show_all(self):
+        """显示所有结果（追加模式）"""
+        if not self.current_results:
+            return
+        
+        # 如果已有内容，先添加分隔
+        if self.result_text.get("1.0", tk.END).strip():
+            separator = "-" * self.separator_length
+            self.result_text.insert(tk.END, f"\n\n{separator}\n=== 显示全部结果 ===\n{separator}\n\n")
+        
+        total = len(self.current_results)
+        
+        for i, row in enumerate(self.current_results, 1):
+            self.result_text.insert(tk.END, f"[{i}] ----------------------------------------\n")
+            self.result_text.insert(tk.END, self._format_row(row) + "\n\n")
+        
+        self.result_label.config(text=f"查询结果: {total}/{total}")
+        self.current_index = total
+        self.result_text.see(tk.END)
 
 
 def main():
     """主函数"""
-    tool = DBQueryTool()
-    
-    while True:
-        print_menu()
-        choice = input("\n请选择功能 (0-7): ").strip()
-        
-        if choice == '0':
-            print("\n👋 再见！")
-            break
-        
-        elif choice == '1':
-            tag = input("请输入标签名: ").strip()
-            limit_str = input("限制数量（回车=全部）: ").strip()
-            limit = int(limit_str) if limit_str else None
-            tool.query_by_tag(tag, limit)
-        
-        elif choice == '2':
-            filename = input("请输入文件名: ").strip()
-            tool.query_by_filename(filename)
-        
-        elif choice == '3':
-            tags_input = input("请输入标签（逗号分隔，如: tt aa, t4）: ").strip()
-            tags = [t.strip() for t in tags_input.split(',')]
-            match_all_input = input("匹配模式 (1=全部匹配, 0=任意匹配, 默认0): ").strip()
-            match_all = match_all_input == '1'
-            tool.query_by_pic_tags(tags, match_all)
-        
-        elif choice == '4':
-            tool.list_all_tags()
-        
-        elif choice == '5':
-            tool.get_statistics()
-        
-        elif choice == '6':
-            print("\n请输入图片信息（必填项）:")
-            pic_data = {
-                'pic_id': input("  图片ID: ").strip(),
-                'tag_name': input("  标签名: ").strip(),
-                'filename': input("  文件名: ").strip(),
-                'file_path': input("  文件路径: ").strip(),
-            }
-            print("\n可选项（回车跳过）:")
-            file_size = input("  文件大小(字节): ").strip()
-            if file_size:
-                pic_data['file_size'] = int(file_size)
-            pic_url = input("  图片URL: ").strip()
-            if pic_url:
-                pic_data['pic_url'] = pic_url
-            pic_tags = input("  图片标签: ").strip()
-            if pic_tags:
-                pic_data['pic_tags'] = pic_tags
-            pic_time = input("  上传时间: ").strip()
-            if pic_time:
-                pic_data['pic_time'] = pic_time
-            pic_date = input("  上传日期: ").strip()
-            if pic_date:
-                pic_data['pic_date'] = pic_date
-            
-            tool.insert_picture(pic_data)
-        
-        elif choice == '7':
-            pic_id = input("请输入图片ID: ").strip()
-            tag_name = input("请输入标签名: ").strip()
-            confirm = input(f"确认删除 '{tag_name}' 下的图片 '{pic_id}' ? (y/n): ").strip().lower()
-            if confirm == 'y':
-                tool.delete_picture(pic_id, tag_name)
-        
-        else:
-            print("\n❌ 无效选择，请重新输入")
-        
-        input("\n按回车继续...")
+    root = tk.Tk()
+    app = DBQueryGUI(root)
+    root.mainloop()
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n👋 程序已终止")
-    except Exception as e:
-        print(f"\n❌ 发生错误: {e}")
-        import traceback
-        traceback.print_exc()
+    main()
 

@@ -6,14 +6,13 @@
     - Line 30:  配置加载 (load_config)
     - Line 50:  正则表达式工具 (Regex)
     - Line 115: 文件操作工具 (read_json, write_json, read_lines, etc.)
-    - Line 205: 日志管理器 (LoggerManager)
-    - Line 255: 网络客户端 (WebClient)
-    - Line 355: 数据库管理器 (DatabaseManager)
+    - Line 230: parse_exauthor (排除规则解析)
+    - Line 280: 网络客户端 (WebClient)
+    - Line 380: 数据库管理器 (DatabaseManager)
 """
 import os
 import re
 import json
-import logging
 import threading
 import sqlite3
 import requests
@@ -21,7 +20,6 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from logging.handlers import RotatingFileHandler
 from bs4 import BeautifulSoup
 
 
@@ -228,6 +226,35 @@ def load_tag_mapping(reverse: bool = False) -> dict:
     return mapping
 
 
+def parse_exauthor(exauthor_lines: List[str]) -> tuple:
+    """
+    解析 exauthor 规则
+    
+    Args:
+        exauthor_lines: exauthor.txt 的行列表
+    
+    Returns:
+        tuple: (skip_tags: set, exclude_author_tags: dict)
+            - skip_tags: 需要跳过的tag集合（没有逗号的行）
+            - exclude_author_tags: {tag: [author1, author2]} 格式的排除规则
+    """
+    skip_tags = set()
+    exclude_author_tags = {}
+    
+    for line in exauthor_lines:
+        parts = line.rstrip('\n').split(',')
+        if len(parts) == 1:
+            # 没有逗号，单独tag，需要跳过
+            skip_tags.add(parts[0].strip())
+        elif len(parts) > 1:
+            # 有逗号，第一个是tag，后面是排除的作者
+            tag_name = parts[0].strip()
+            authors = [p.strip() for p in parts[1:]]
+            exclude_author_tags[tag_name] = authors
+    
+    return skip_tags, exclude_author_tags
+
+
 def get_max_file_number(directory: str, pattern: str = r'(\d{1,4})_') -> int:
     """获取目录中最大文件序号"""
     max_num = 0
@@ -246,57 +273,6 @@ def get_max_file_number(directory: str, pattern: str = r'(\d{1,4})_') -> int:
         pass
     
     return max_num
-
-
-# ==================== 线程安全日志 ====================
-
-class LoggerManager:
-    """线程安全日志管理器（单例）"""
-    _instances = {}
-    _lock = threading.Lock()
-    
-    @classmethod
-    def get_logger(cls, name: str, log_dir: Optional[str] = None) -> logging.Logger:
-        """获取日志器（单例模式）"""
-        with cls._lock:
-            if name not in cls._instances:
-                logger = logging.getLogger(f'gelbooru.{name}')
-                logger.setLevel(logging.INFO)
-                
-                if not logger.handlers:
-                    # 文件日志（支持轮转）
-                    if log_dir:
-                        ensure_dir(log_dir)
-                        log_path = os.path.join(log_dir, f'z {name}.txt')
-                        file_handler = RotatingFileHandler(
-                            log_path,
-                            maxBytes=LOG_MAX_SIZE,
-                            backupCount=LOG_BACKUP_COUNT,
-                            encoding='utf-8'
-                        )
-                        formatter = logging.Formatter(
-                            '%(asctime)s | %(message)s',
-                            datefmt='%Y-%m-%d %H:%M:%S'
-                        )
-                        file_handler.setFormatter(formatter)
-                        logger.addHandler(file_handler)
-                    
-                    # 控制台日志
-                    console = logging.StreamHandler()
-                    console.setFormatter(logging.Formatter(
-                        '%(asctime)s | %(message)s',
-                        datefmt='%Y-%m-%d %H:%M:%S'
-                    ))
-                    logger.addHandler(console)
-                
-                cls._instances[name] = logger
-            
-            return cls._instances[name]
-
-
-def get_logger(name: str, log_dir: Optional[str] = None) -> logging.Logger:
-    """获取日志器便捷函数"""
-    return LoggerManager.get_logger(name, log_dir)
 
 
 # ==================== 网络客户端 ====================
@@ -408,7 +384,6 @@ class DatabaseManager:
             self._thread_local.connection.execute('PRAGMA journal_mode=WAL')
             self._thread_local.connection.execute('PRAGMA synchronous=NORMAL')
         return self._thread_local.connection
-    
     @contextmanager
     def get_cursor(self):
         """获取游标的上下文管理器"""
@@ -476,7 +451,7 @@ class DatabaseManager:
                     end_pic TEXT DEFAULT '0',
                     status INTEGER DEFAULT 0,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
@@ -665,4 +640,3 @@ class DatabaseManager:
 def get_database(db_path: Optional[str] = None) -> DatabaseManager:
     """获取数据库实例的便捷函数"""
     return DatabaseManager(db_path)
-

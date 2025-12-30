@@ -10,8 +10,8 @@ from win32file import GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING
 from pywintypes import Time
 
 # 导入配置和工具
-from core import config, MAX_WORKERS, DOWN_SKIP_THRESHOLD, FILE_COUNT_CHECK_INTERVAL, RANDOM_DELAY_MIN, RANDOM_DELAY_MAX
-from core import Regex, get_logger, read_lines, get_max_file_number, format_size, get_database, WebClient, load_tag_mapping
+from core import config, DOWN_SKIP_THRESHOLD, FILE_COUNT_CHECK_INTERVAL, RANDOM_DELAY_MIN, RANDOM_DELAY_MAX
+from core import Regex, read_lines, get_max_file_number, format_size, get_database, WebClient, load_tag_mapping, parse_exauthor
 import set_tag
 import sampletag
 
@@ -44,14 +44,8 @@ class Downloader:
         self.new_path = config['path']['new']
         self.base_url = config['url']
         
-        # 尝试使用新模块
-        try:
-            self.db = get_database()
-            self.use_db = True
-        except Exception as e:
-            self.use_db = False
-            print(f"⚠️  数据库初始化失败: {e}")
-            print("   将仅使用文本文件存储")
+        # 初始化数据库连接
+        self.db = get_database()
         
         # 读取排除规则
         self.extag = read_lines(config['path']['extag'])
@@ -59,19 +53,8 @@ class Downloader:
         self.expic = set(read_lines(config['path']['expic']))
         self.dead_tag = read_lines(config['path']['deadtag'])
         
-        # 解析 exauthor：分离跳过的tag和排除规则
-        self.skip_tags = set()  # 只有单独tag的，需要跳过
-        self.exclude_author_tags = {}  # tag: [author1, author2] 格式的排除规则
-        for line in self.exauthor:
-            parts = line.rstrip('\n').split(',')
-            if len(parts) == 1:
-                # 没有逗号，单独tag，需要跳过
-                self.skip_tags.add(parts[0].strip())
-            elif len(parts) > 1:
-                # 有逗号，第一个是tag，后面是排除的作者
-                tag_name = parts[0].strip()
-                authors = [p.strip() for p in parts[1:]]
-                self.exclude_author_tags[tag_name] = authors
+        # 解析 exauthor 规则
+        self.skip_tags, self.exclude_author_tags = parse_exauthor(self.exauthor)
         
         # 统计
         self.downed_cnt = 0
@@ -259,6 +242,101 @@ class Downloader:
             'tags': pic_tags
         })
     
+    def _build_image_metadata(self, pic_id, pic_filename, new_filename, 
+                               original_save_path, new_save_path, size,
+                               pic_url, pic_tags, pic_time, pic_date):
+        """构建图片元数据字典（R5: 提取公共方法）"""
+        return {
+            'pic_id': pic_id,
+            'tag_name': self.replace_tag,
+            'filename': pic_filename,
+            'new_filename': new_filename,
+            'file_path': original_save_path,
+            'file_size': size,
+            'pic_url': pic_url,
+            'pic_tags': pic_tags,
+            'pic_time': pic_time,
+            'pic_date': pic_date,
+            'save_path': original_save_path,
+            'new_path': new_save_path
+        }
+    
+    def _collect_statistics(self, start_time=None, downloaded_this_tag=None, total_size_this_tag=None):
+        """收集统计信息（R6: 提取公共方法）"""
+        stats = {
+            'downloaded': self.downed_cnt,
+            'failed': self.failed_cnt,
+            'total_size': self.total_download_size
+        }
+        if start_time is not None:
+            stats['elapsed_minutes'] = round((time.time() - start_time) / 60)
+        return stats
+    
+    def _process_single_image(self, img_url, img_id, file_counter, tag, log_prefix=""):
+        """
+        处理单张图片的下载流程（R1: 提取公共方法）
+        
+        Args:img_url: 图片详情页URL
+            img_id: 图片ID
+            file_counter: 当前文件计数
+            tag: 标签名
+            log_prefix: 日志前缀（用于区分Mode 1/2和Mode 3）
+        
+        Returns:
+            tuple: (success: bool, new_file_counter: int, skip: bool)
+                - success: 是否成功下载
+                - new_file_counter: 更新后的文件计数
+                - skip: 是否为跳过（文件已存在）
+        """
+        # 获取详情页
+        detail_soup = self.web.get_soup(img_url, retries=50)
+        if not detail_soup:
+            return False, file_counter, False
+        
+        pic_time, pic_date, pic_id, pic_url, pic_tags, pic_filename = self._extract_metadata(detail_soup)
+        if not pic_filename:
+            return False, file_counter, False
+        
+        # 记录最新的图片时间
+        self._add_downloadtag(tag, pic_time)
+        
+        new_filename = f"{file_counter}_{self.replace_tag}_{pic_date}_{pic_id}.{pic_filename.split('.')[-1]}"
+        original_save_path = os.path.join(self.gelbooru_path, self.replace_tag, pic_filename)
+        new_save_path = os.path.join(self.new_path, new_filename)
+        
+        # 检查是否已存在
+        if os.path.exists(original_save_path):
+            # 直接写入tag自己的tags.txt
+            set_tag.update_tags(self.replace_tag, f"{tag}|{pic_time}|{pic_filename}|{pic_id}|{pic_tags}")
+            return False, file_counter, True  # skip=True
+        
+        # 下载图片
+        image_content = self.web.download_image(pic_url, retries=50)
+        
+        if not image_content:
+            self.failed_cnt += 1
+            self.log(f'{log_prefix}failed {tag} {pic_filename}')
+            self._write_failed(tag, pic_url, pic_time, pic_id, pic_filename, pic_tags)
+            return False, file_counter, False
+        
+        size = len(image_content)
+        self.total_download_size += size
+        
+        # 构建元数据并保存图片
+        image_metadata = self._build_image_metadata(
+            pic_id, pic_filename, new_filename,
+            original_save_path, new_save_path, size,
+            pic_url, pic_tags, pic_time, pic_date
+        )
+        
+        self._save_image(image_metadata, image_content)
+        self.downed_cnt += 1
+        
+        # 写入tag自己的tags.txt
+        set_tag.update_tags(self.replace_tag, f"{tag}|{pic_time}|{pic_filename}|{pic_id}|{pic_tags}")
+        
+        return True, file_counter + 1, False
+
     def download_single(self, tag, tag_config):
         """
         单标签下载（只负责下载和收集数据，不写入文件）
@@ -380,7 +458,7 @@ class Downloader:
                             'filename': pic_filename,
                             'new_filename': new_filename,
                             'file_path': original_save_path,
-                            'file_size': size,
+                 'file_size': size,
                             'pic_url': pic_url,
                             'pic_tags': pic_tags,
                             'pic_time': pic_time,
@@ -527,7 +605,7 @@ class Downloader:
                     skip_count += 1
                     if skip_count >= DOWN_SKIP_THRESHOLD:
                         # 连续skip达到阈值，停止下载这个tag
-                        self.log(f'{tag}({offset}) skip threshold reached, stopping')
+                        #self.log(f'{tag}({offset}) skip threshold reached, stopping')
                         break
                 else:
                     skip_count = 0  # 重置skip计数
@@ -633,7 +711,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
     """
     downloader = Downloader()
     downloader.init_batch(offset)
-    downloader.log('Start (Queue Mode)')
+    downloader.log('Start')
     
     # 创建启动文件
     with open(downloader.startfile, 'w') as f:
@@ -650,7 +728,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
             # 遇到结束标记（None），退出循环
             if tag is None:
                 task_queue.task_done()
-                downloader.log('Received stop signal')
+                #downloader.log('Received stop signal')
                 break
             
             try:
@@ -705,4 +783,3 @@ def down_batch_mode3_queue(task_queue, offset=0):
     downloader.result['done_tags'] = done_tags
     
     return downloader.result
-

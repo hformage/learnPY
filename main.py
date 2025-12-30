@@ -12,24 +12,35 @@ import sys
 import os
 import time
 import queue
+import atexit
 import concurrent.futures
-from core import (
-    Regex, LoggerManager, WebClient, DatabaseManager, format_size, load_tag_mapping
-)
 import datetime
 import glob
 from operator import itemgetter
 import set_tag
 from set_tag import writefile, readfile
-import sampletag
 from downloader import down_single, down_batch_mode3_queue, set_sample_executor
-from core import config, get_database, load_tag_mapping
+from core import config, get_database, load_tag_mapping, format_size
 
 # 全局缩略图线程池（单线程，避免PIL并发问题）
 sample_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='sample')
 
 # 设置到downloader模块
 set_sample_executor(sample_executor)
+
+
+def _cleanup_on_exit():
+    """程序退出时清理资源"""
+    # 关闭缩略图线程池
+    sample_executor.shutdown(wait=True)
+    # 关闭数据库连接
+    try:
+        get_database().close_all_connections()
+    except Exception:
+        pass
+
+# 注册退出清理钩子
+atexit.register(_cleanup_on_exit)
 
 
 def write_failed_records(failed_records):
@@ -169,21 +180,10 @@ def print_summary_statistics(total_downloaded, total_failed, total_size):
     print("           汇总统计")
     print("="*50)
     
-    # 计算总大小和平均大小
+    # 使用 format_size 统一格式化
     if total_size > 0:
-        if total_size < 1024 * 1024:
-            # 小于1MB，用KB显示
-            total_size_str = f"{total_size / 1024:.2f} Kb"
-            avg_size_str = f"{total_size / total_downloaded / 1024:.2f} Kb" if total_downloaded > 0 else "0 Kb"
-        elif total_size < 1024 * 1024 * 1024:
-            # 小于1GB，用MB显示
-            total_size_str = f"{total_size / 1024 / 1024:.2f} Mb"
-            avg_size_str = f"{total_size / total_downloaded / 1024 / 1024:.2f} Mb" if total_downloaded > 0 else "0 Mb"
-        else:
-            # 大于1GB，用GB显示
-            total_size_str = f"{total_size / 1024 / 1024 / 1024:.2f} Gb"
-            avg_size_str = f"{total_size / total_downloaded / 1024 / 1024:.2f} Mb" if total_downloaded > 0 else "0 Mb"
-        
+        total_size_str = format_size(total_size)
+        avg_size_str = format_size(total_size // total_downloaded) if total_downloaded > 0 else "0 B"
         print(f"Total size: {total_size_str}  avg size: {avg_size_str}")
     
     print(f"Total download: {total_downloaded} failed: {total_failed}")
@@ -204,23 +204,36 @@ def handle_result(result):
     Args:
         result: Downloader返回的字典
     """
-    # 1. 写入失败记录
+    db = get_database()
+    
+    # 1. 写入失败记录（同时写入txt和数据库）
     if result.get('failed_records'):
         write_failed_records(result['failed_records'])
+        # 同时写入数据库
+        for record in result['failed_records']:
+            db.add_failed_download(
+                record['tag'], record['url'], record['time'],
+                record['id'], record['filename'], record['tags']
+            )
     
-    # 2. 下载完成，删除数据库记录
+    # 2. 写入下载成功的图片记录到数据库
+    if result.get('downloaded_files'):
+        for file_info in result['downloaded_files']:
+            db.add_picture(file_info)
+    
+    # 3. 下载完成，删除数据库进度记录
     if result.get('delete_tag'):
         set_tag.delete_tagjson(result['tag'])
     
-    # 3. 设置为完成
+    # 4. 设置为完成
     if result.get('set_input_done'):
         set_tag.set_input_done(result['set_input_done'])
     
-    # 6. 删除启动文件
+    # 5. 删除启动文件
     if result.get('remove_startfile') and os.path.exists(result.get('remove_startfile')):
-        os.remove(result['remove_startfile'])
+       os.remove(result['remove_startfile'])
     
-    # 7. 添加过期tag
+    # 6. 添加过期tag
     if result.get('expire_tags'):
         for expire_tag in result['expire_tags']:
             set_tag.add_expire_tag(expire_tag)
@@ -432,7 +445,6 @@ def mode_1():
                         # 立即标记done（避免下次重新读取）
                         if result.get('set_input_done'):
                             set_tag.set_input_done(result['set_input_done'])
-                        
                     except Exception as e:
                         print(f"✗ {tag} 出错: {e}")
                 
@@ -686,4 +698,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

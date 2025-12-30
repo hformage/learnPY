@@ -1,4 +1,3 @@
-# 图片缩略图拼接模块
 import os
 import heapq
 from PIL import Image
@@ -8,269 +7,205 @@ from core import config
 class ThumbnailMaker:
     """缩略图制作和拼接类"""
     
-    def __init__(self, tag, thumbnail_size=(400, 400), row_width=2400, max_images=90):
-        """
-        初始化
-        
-        Args:
-            tag: 标签名称
-            thumbnail_size: 缩略图尺寸 (width, height)
-            row_width: 每行最大宽度
-            max_images: 最多使用的图片数量
-        """
+    def __init__(self, tag, thumbnail_size=(400, 400), row_width=2400, rows_per_montage=3, max_images=90):
         self.tag = tag
         self.thumbnail_size = thumbnail_size
         self.row_width = row_width
+        self.rows_per_montage = rows_per_montage
         self.max_images = max_images
-        
-        # 从配置读取路径
         self.source_dir = os.path.join(config['path']['Gelbooru'], tag)
         self.target_dir = os.path.join(config['path']['Gelbooru'], 'sample')
-        
-        # 确保目标目录存在
         os.makedirs(self.target_dir, exist_ok=True)
-        
-        # 记录新创建的文件
-        self.created_files = set()
     
     def get_images_sorted_by_time(self):
-        """
-        获取目录下的图片，按修改时间降序排序
-        
-        性能优化：
-        1. 使用 os.scandir() 替代 os.listdir()（快3-4倍）
-        2. 使用 heapq.nlargest() 替代 sorted()（只需要前N个，O(n*log(k)) vs O(n*log(n))）
-        3. 避免先构建完整字典再排序
-        
-        Returns:
-            list: 图片路径列表（最新的在前）
-        """
+        """获取目录下最新的N张图片路径和文件名"""
         if not os.path.exists(self.source_dir):
             print(f'目录不存在: {self.source_dir}')
-            return []
+            return [], []
         
         image_list = []
-        
         try:
-            # 使用 scandir() 而不是 listdir()，避免重复调用 os.path.join
             with os.scandir(self.source_dir) as entries:
                 for entry in entries:
-                    # 只处理图片文件（直接用 entry 对象，不需要额外的 stat 调用）
-                    if not entry.is_file():
-                        continue
-                    
-                    name_lower = entry.name.lower()
-                    if not (name_lower.endswith('.png') or 
-                            name_lower.endswith('.jpg') or 
-                            name_lower.endswith('.jpeg')):
-                        continue
-                    
-                    try:
-                        # 直接从 entry.stat() 获取修改时间，避免额外的 stat 调用
-                        stat_result = entry.stat()
-                        mtime = stat_result.st_mtime
-                        image_list.append((mtime, entry.path))
-                    except Exception as e:
-                        print(f'无法读取 {entry.path}: {e}')
+                    if entry.is_file() and entry.name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        try:
+                            image_list.append((entry.stat().st_mtime, entry.path, entry.name))
+                        except Exception:
+                            pass
         except Exception as e:
             print(f'无法扫描目录 {self.source_dir}: {e}')
-            return []
+            return [], []
         
-        # 返回全部图片，按时间降序
-        image_list.sort(reverse=True)
-        return [path for _, path in image_list]
+        if not image_list:
+            return [], []
+        
+        if len(image_list) <= self.max_images:
+            image_list.sort(reverse=True)
+        else:
+            image_list = heapq.nlargest(self.max_images, image_list)
+        
+        paths = [item[1] for item in image_list]
+        names = [item[2] for item in image_list]
+        return paths, names
     
     def create_thumbnail(self, image_path):
-        """
-        创建缩略图
-        
-        性能优化：
-        1. 使用 Image.LANCZOS 保持质量
-        2. 尽早转换为 RGB 减少后续处理
-        3. 异常处理更精细
-        
-        Args:
-            image_path: 原始图片路径
-            
-        Returns:
-            Image对象或None
-        """
+        """创建缩略图并转换为RGB格式"""
         try:
             with Image.open(image_path) as img:
-                # 如果图片已经很小，直接返回
-                if img.width <= self.thumbnail_size[0] and img.height <= self.thumbnail_size[1]:
-                    return img.convert('RGB').copy()
-                
-                # 创建缩略图（使用高质量的 LANCZOS 算法）
-                img.thumbnail(self.thumbnail_size, Image.Resampling.LANCZOS)
-                
-                # 转换为 RGB（处理 RGBA、灰度等格式）
+                if img.width > self.thumbnail_size[0] or img.height > self.thumbnail_size[1]:
+                    img.thumbnail(self.thumbnail_size, Image.Resampling.LANCZOS)
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                
-                # 必须 copy() 因为使用了 with 语句
                 return img.copy()
-        except Exception as e:
-            # 不打印错误，避免大量输出
+        except Exception:
             return None
     
-    def split_images_into_rows(self, images):
-        """
-        将图片列表分成3行，每行宽度不超过 row_width
+    def split_into_rows(self, thumbnails, start_idx=0):
+        """将缩略图分成多行，返回(行列表, 消耗的图片数)"""
+        rows = []
+        current_row = []
+        current_width = 0
+        consumed = 0
         
-        Args:
-            images: Image对象列表
+        for i in range(start_idx, len(thumbnails)):
+            thumb = thumbnails[i]
+            if current_width + thumb.width > self.row_width and current_row:
+                rows.append(current_row)
+                if len(rows) >= self.rows_per_montage:
+                    return rows, consumed
+                current_row = []
+                current_width = 0
             
-        Returns:
-            list: [[row1_images], [row2_images], [row3_images]]
-        """
-        rows = [[], [], []]
-        row_widths = [0, 0, 0]
-        current_row = 0
+            current_row.append(thumb)
+            current_width += thumb.width
+            consumed += 1
         
-        for img in images:
-            # 如果当前行加上这张图会超宽，切换到下一行
-            if row_widths[current_row] + img.width > self.row_width and rows[current_row]:
-                current_row += 1
-                if current_row >= 3:
-                    break
-            
-            rows[current_row].append(img)
-            row_widths[current_row] += img.width
+        if current_row and len(rows) < self.rows_per_montage:
+            rows.append(current_row)
         
-        # 过滤空行
-        return [row for row in rows if row]
+        return rows, consumed
     
-    def create_montage(self, image_paths, index=1):
-        """
-        创建图片拼接
+    def create_montage(self, rows, montage_index, first_image_name):
+        """从行数据创建拼接图并保存"""
+        total_images = sum(len(row) for row in rows)
+        if total_images < 2:
+            return None
         
-        性能优化：
-        1. 批量创建缩略图，减少 I/O 等待
-        2. 预分配列表大小
-        3. 使用更高效的循环
-        
-        Args:
-            image_paths: 图片路径列表
-            
-        Returns:
-            bool: 是否成功
-        """
-        if not image_paths:
-            print(f'{self.tag}: 没有找到图片')
-            return False
-        # 批量创建缩略图（预分配列表）
-        thumbnails = []
-        failed_count = 0
-        for path in image_paths:
-            thumb = self.create_thumbnail(path)
-            if thumb:
-                thumbnails.append(thumb)
-            else:
-                failed_count += 1
-        if failed_count > 0:
-            print(f'{self.tag}: {failed_count} 张图片无法处理')
-        if len(thumbnails) < 1:
-            print(f'{self.tag}: 有效图片太少（少于1张）')
-            return False
-        # 分成3行
-        rows = self.split_images_into_rows(thumbnails)
-        if not rows:
-            return False
-        row_heights = [max((img.height for img in row), default=0) for row in rows]
+        row_heights = [max(img.height for img in row) for row in rows]
         row_widths = [sum(img.width for img in row) for row in rows]
-        canvas_width = max(row_widths) if row_widths else 0
+        canvas_width = max(row_widths)
         canvas_height = sum(row_heights)
-        if canvas_width == 0 or canvas_height == 0:
-            return False
+        
+        # for idx, (row, width, height) in enumerate(zip(rows, row_widths, row_heights), 1):
+        #     print(f'{self.tag}:   第{idx}行: {len(row)}张, 宽{width}px, 高{height}px')
+        
         canvas = Image.new('RGB', (canvas_width, canvas_height))
-        y_offset = 0
+        
+        y = 0
         for row_idx, row in enumerate(rows):
-            x_offset = 0
+            x = 0
             for img in row:
-                canvas.paste(img, (x_offset, y_offset))
-                x_offset += img.width
-            y_offset += row_heights[row_idx]
-        # 保存
-        output_filename = f'{self.tag}_montage_{index}_{os.path.basename(image_paths[0])}'
-        output_filename = os.path.splitext(output_filename)[0] + '.jpg'
+                canvas.paste(img, (x, y))
+                x += img.width
+            y += row_heights[row_idx]
+        
+        first_name_base = os.path.splitext(first_image_name)[0]
+        output_filename = f'{self.tag}_{montage_index}_{first_name_base}.jpg'
         output_path = os.path.join(self.target_dir, output_filename)
+        
         try:
             canvas.save(output_path, 'JPEG', quality=85, optimize=True)
-            self.created_files.add(output_path)
-            print(f'{self.tag}: 拼接完成 -> {output_filename} ({len(thumbnails)}张图片)')
-            return True
+            print(f'{output_filename}')
+            #print(f'{self.tag}:   画布{canvas_width}×{canvas_height}px, {total_images}张图片, {len(rows)}行')
+            return output_path
         except Exception as e:
-            print(f'{self.tag}: 保存失败 {output_path}: {e}')
-            return False
+            print(f'{self.tag}: 保存失败: {e}')
+            return None
     
     def delete_old_thumbnails(self):
-        """
-        删除该 tag 的旧缩略图（不在 created_files 中的）
-        性能优化：
-        1. 使用 os.scandir() 替代 os.listdir()
-        2. 使用 startswith 快速过滤
-        3. 批量删除，减少打印
-        """
+        """删除该tag的所有旧缩略图"""
         deleted_count = 0
         prefix = self.tag + '_'
+        prefix_len = len(prefix)
         
         try:
             with os.scandir(self.target_dir) as entries:
                 for entry in entries:
-                    # 快速过滤：只检查以 tag_ 开头的文件
-                    if not entry.is_file():
-                        continue
-                    if not entry.name.startswith(prefix):
-                        continue
-                    
-                    # 如果不是刚创建的文件，删除
-                    if entry.path not in self.created_files:
+                    name = entry.name
+                    if (entry.is_file() and 
+                        name.startswith(prefix) and 
+                        name.lower().endswith('.jpg') and
+                        len(name) > prefix_len and 
+                        name[prefix_len].isdigit()):
                         try:
                             os.remove(entry.path)
                             deleted_count += 1
-                        except Exception as e:
-                            print(f'删除失败 {entry.path}: {e}')
+                        except Exception:
+                            pass
         except Exception as e:
-            print(f'扫描目录失败 {self.target_dir}: {e}')
+            print(f'{self.tag}: 扫描目录失败: {e}')
         
         if deleted_count > 0:
-            print(f'{self.tag}: 删除旧缩略图 {deleted_count} 个')
+            print(f'{self.tag}: Delete {deleted_count}')
     
     def process(self):
-        """
-        执行完整流程：获取图片 -> 分批创建拼接 -> 删除旧文件
-        """
-        image_paths = self.get_images_sorted_by_time()
+        """执行完整流程：删除旧文件 -> 生成缩略图 -> 创建拼接图"""
+        self.delete_old_thumbnails()
+        
+        image_paths, image_names = self.get_images_sorted_by_time()
         if not image_paths:
-            print(f'{self.tag}: 没有找到图片')
+            print(f'{self.tag}: No pictures found')
             return
-        max_images = self.max_images
-        total = len(image_paths)
-        index = 1
-        success_any = False
-        for start in range(0, total, max_images):
-            batch = image_paths[start:start+max_images]
-            success = self.create_montage(batch, index=index)
-            if success:
-                success_any = True
-            index += 1
-        if success_any:
-            self.delete_old_thumbnails()
+        
+        print(f'{self.tag}: Finds  {len(image_paths)}')
+        #print(f'{self.tag}: 正在生成缩略图...')
+        
+        thumbnails = []
+        valid_names = []
+        failed_count = 0
+        
+        for path, name in zip(image_paths, image_names):
+            thumb = self.create_thumbnail(path)
+            if thumb:
+                thumbnails.append(thumb)
+                valid_names.append(name)
+            else:
+                failed_count += 1
+        
+        # if failed_count > 0:
+        #     print(f'{self.tag}: {failed_count} 张图片无法处理')
+        
+        if len(thumbnails) < 2:
+            #print(f'{self.tag}: 有效图片太少')
+            return
+        
+        #print(f'{self.tag}: 成功创建 {len(thumbnails)} 张缩略图')
+        
+        created_count = 0
+        thumb_idx = 0
+        
+        while thumb_idx < len(thumbnails):
+            rows, consumed = self.split_into_rows(thumbnails, thumb_idx)
+            
+            if sum(len(row) for row in rows) < 2:
+                break
+            
+            if self.create_montage(rows, created_count + 1, valid_names[thumb_idx]):
+                created_count += 1
+            
+            thumb_idx += consumed
+        
+        if created_count > 0:
+            print(f'{self.tag}: Total  {created_count}')
+        else:
+            print(f'{self.tag}: No pictures')
 
 
 def main(tag):
-    """
-    主函数 - 为指定 tag 创建缩略图拼接
-    
-    Args:
-        tag: 标签名称
-    """
-    maker = ThumbnailMaker(tag)
-    maker.process()
+    """为指定tag创建缩略图拼接"""
+    ThumbnailMaker(tag).process()
 
 
 if __name__ == '__main__':
-    # 测试
     main('14c')
 
