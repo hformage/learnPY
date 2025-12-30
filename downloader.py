@@ -746,7 +746,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
                     downloader.log(f'Skip tag {tag}')
                     continue
                 
-                downloader.log(f' {tag}({offset})')
+                downloader.log(f'Tag({offset})  {tag}')
                 
                 # 下载这个tag的新图片（使用skip逻辑）
                 result = downloader._download_tag_batch(tag, offset)
@@ -760,7 +760,7 @@ def down_batch_mode3_queue(task_queue, offset=0):
         except queue.Empty:
             # 队列为空且超时，检查是否真的完成了
             if task_queue.empty():
-                downloader.log('Queue empty, exiting')
+                #downloader.log('Queue empty, exiting')
                 break
             continue
             
