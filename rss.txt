@@ -1,0 +1,506 @@
+以专业的眼光分析下面的代码，并进行优化和重构，让效率更加高效,并且这是我个人使用，不想创建很多文件，希望你能在一个python文件和一个log文件的基础上优化他，配置还是放在python文件开头保持不变，优化代码和log，下面是我的修改需求：
+修改代码，在查询结果栏点击一条结果的任意位置都会对前面的选择框打勾或者取消打勾，然后历史记录rss.log需要根据每个rss的类别，比如mikanime就只读mikanime的历史rss并在mikanime查询的时候才显示，moe就只读moe的历史并在自己查询的时候显示，不要混乱了，在rss.log里面应该对两个来源做出区分，查mikanime的时候，在rss.log里面增加rss_name=mikanime，默认是PRESET_RSS下面的名字，rss.log还是保持一个文件，不要产生多余的文件,注意PRESET_RSS里面的内容是自定义的，我这里只添加了两个作为举例，优化时rss.log里面默认为空，不用关心旧的历史记录,保留查询结果满足include的时候把结果排列到前面，没打勾的排列到后面
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import feedparser
+import requests
+import re
+from threading import Thread
+from io import BytesIO
+from urllib.parse import unquote
+from PIL import Image, ImageTk
+import hashlib
+import json
+import os
+from datetime import datetime, timedelta
+
+# ====== 配置区 ======
+QB_LOGIN_URL = "http://192.168.50.3:8080/api/v2/auth/login"
+QB_ADD_TORRENT_URL = "http://192.168.50.3:8080/api/v2/torrents/add"
+USERNAME = "admin"
+PASSWORD = "xxx"  # ← 替换为你的密码！
+
+PRESET_RSS = {
+    "mikanime": {
+        "url": "https://mikanime.tv/RSS/MyBangumi?token=2iwXTp1m89Rxj92aJIfIrA%3d%3d",
+        "include": r"1月|新番|ani",
+        "exclude": r"英语|巴哈"
+    },
+    "moe": {
+        "url": "https://www.anix.moe/rss.xml",
+        "include": r"JK",
+        "exclude": r"英文"
+    },
+}
+
+# ====== 新增常量 ======
+IMAGE_WIDTH = 150
+IMAGE_HEIGHT = 150
+TEXT_WRAP_LENGTH = 600
+IMAGE_TIMEOUT = 15
+PAGE_SIZE = 50                  # 每页条数
+HISTORY_RETENTION_DAYS = 7      # 历史保留天数
+HISTORY_FILE = "rss.log"        # 同目录日志文件
+
+
+def extract_magnet_links(text):
+    if not text:
+        return []
+    magnets = set()
+    magnet_pattern = r'(magnet:\?xt=urn:btih:[a-zA-Z0-9]+(?:&[a-zA-Z0-9%._-]+)*)'
+    for m in re.findall(magnet_pattern, text, re.IGNORECASE):
+        magnets.add(m)
+    infohash_pattern = r'\b([a-fA-F0-9]{40})\b'
+    for h in re.findall(infohash_pattern, text):
+        if len(h) == 40:
+            magnets.add(f"magnet:?xt=urn:btih:{h.lower()}")
+    return list(magnets)
+
+
+def extract_image_url(text):
+    if not text:
+        return None
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>', text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def normalize_infohash(magnet):
+    match = re.search(r'btih:([a-zA-Z0-9]{32,40})', magnet, re.IGNORECASE)
+    if not match:
+        return None
+    ih = match.group(1).lower()
+    if len(ih) == 40:
+        return ih
+    return None
+
+
+def matches_filter(title, summary, include_pat, exclude_pat):
+    full_text = (title or "") + " " + (summary or "")
+    if exclude_pat.strip():
+        try:
+            if re.search(exclude_pat, full_text, re.IGNORECASE):
+                return False
+        except re.error:
+            pass
+    if include_pat.strip():
+        try:
+            return bool(re.search(include_pat, full_text, re.IGNORECASE))
+        except re.error:
+            return False
+    return False
+
+
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+    history = {}
+    cutoff = datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for line in reversed(lines):
+            try:
+                entry = json.loads(line.strip())
+                ts_str = entry.get('timestamp')
+                if ts_str:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts < cutoff:
+                        continue
+                ih = entry['infohash']
+                if ih not in history:
+                    history[ih] = entry
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return history
+
+
+def save_to_history(entries):
+    try:
+        with open(HISTORY_FILE, 'a', encoding='utf-8') as f:
+            for entry in entries:
+                entry_with_ts = entry.copy()
+                entry_with_ts['timestamp'] = datetime.now().isoformat()
+                f.write(json.dumps(entry_with_ts, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
+def clear_old_history():
+    if not os.path.exists(HISTORY_FILE):
+        return
+    cutoff = datetime.now() - timedelta(days=HISTORY_RETENTION_DAYS)
+    valid_lines = []
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    ts_str = entry.get('timestamp')
+                    if ts_str:
+                        ts = datetime.fromisoformat(ts_str)
+                        if ts >= cutoff:
+                            valid_lines.append(line)
+                except Exception:
+                    continue
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            f.writelines(valid_lines)
+    except Exception:
+        pass
+
+
+class RSSDownloaderApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RSS 磁力下载器")
+        self.root.geometry("980x780")
+        
+        self.entries = {}          # {infohash: entry}
+        self.check_vars = {}
+        self.entry_widgets = {}
+        self.photo_images = []
+        self.all_entries = []
+        self.current_page = 0
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        rss_frame = tk.Frame(self.root)
+        rss_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(rss_frame, text="RSS:").pack(side='left')
+        self.rss_entry = tk.Entry(rss_frame, width=80)
+        self.rss_entry.pack(side='left', fill='x', expand=True)
+        tk.Button(rss_frame, text="查询", command=self.fetch_rss).pack(side='right', padx=(5, 0))
+
+        preset_frame = tk.Frame(self.root)
+        preset_frame.pack(fill='x', padx=10, pady=5)
+        for name, config in PRESET_RSS.items():
+            btn = tk.Button(preset_frame, text=name,
+                            command=lambda n=name, c=config: self.load_preset(n, c))
+            btn.pack(side='left', padx=5)
+        tk.Button(preset_frame, text="清除历史", command=self.clear_history, fg='red').pack(side='right', padx=(5, 0))
+        tk.Button(preset_frame, text="清空", command=self.clear_all).pack(side='right', padx=(5, 0))
+        tk.Button(preset_frame, text="全选", command=self.select_all).pack(side='right', padx=(5, 0))
+
+        filter_frame = tk.Frame(self.root)
+        filter_frame.pack(fill='x', padx=10, pady=5)
+        tk.Label(filter_frame, text="include:").pack(side='left')
+        self.include_entry = tk.Entry(filter_frame, width=40)
+        self.include_entry.pack(side='left', padx=(5, 10))
+        tk.Label(filter_frame, text="exclude:").pack(side='left')
+        self.exclude_entry = tk.Entry(filter_frame, width=40)
+        self.exclude_entry.pack(side='left', padx=(5, 10))
+
+        ttk.Separator(self.root, orient='horizontal').pack(fill='x', pady=5)
+
+        canvas_frame = tk.Frame(self.root)
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        self.canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        self.scrollable_frame.bind("<Configure>", 
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 修复滚轮
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
+
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(fill='x', padx=10, pady=10)
+        tk.Button(btn_frame, text="下载选中项", command=self.download_selected,
+                  bg='green', fg='white').pack(side='right')
+
+    def _bind_mousewheel(self, event):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, event):
+        self.canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+    def load_preset(self, name, config):
+        self.rss_entry.delete(0, tk.END)
+        self.rss_entry.insert(0, config["url"])
+        self.include_entry.delete(0, tk.END)
+        self.include_entry.insert(0, config.get("include", ""))
+        self.exclude_entry.delete(0, tk.END)
+        self.exclude_entry.insert(0, config.get("exclude", ""))
+        self.fetch_rss()
+
+    def select_all(self):
+        for var in self.check_vars.values():
+            var.set(True)
+
+    def clear_all(self):
+        for var in self.check_vars.values():
+            var.set(False)
+
+    def fetch_rss(self):
+        url = self.rss_entry.get().strip()
+        if not url:
+            messagebox.showwarning("警告", "请输入 RSS 链接！")
+            return
+
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.entries.clear()
+        self.check_vars.clear()
+        self.entry_widgets.clear()
+        self.photo_images.clear()
+
+        include_pat = self.include_entry.get()
+        exclude_pat = self.exclude_entry.get()
+        Thread(target=self._fetch_rss_thread, args=(url, include_pat, exclude_pat), daemon=True).start()
+
+    def _fetch_rss_thread(self, url, include_pat, exclude_pat):
+        try:
+            feed = feedparser.parse(url)
+            if getattr(feed, 'bozo', False) and not feed.entries:
+                raise Exception("无效 RSS 源")
+
+            new_entries = []
+            for item in feed.entries:
+                title = item.get('title', '').strip()
+                if not title:
+                    continue
+
+                summary = item.get('summary', '')
+                content_text = ''.join(c.value for c in getattr(item, 'content', [])) if item.get('content') else ''
+                full_desc = (summary + " " + content_text).strip()
+
+                magnet = None
+                if item.get('link', '').startswith('magnet:'):
+                    magnet = item.link
+                elif hasattr(item, 'enclosures'):
+                    for enc in item.enclosures:
+                        if enc.get('href', '').startswith('magnet:'):
+                            magnet = enc.href
+                            break
+                if not magnet:
+                    extracted = extract_magnet_links(full_desc)
+                    magnet = extracted[0] if extracted else None
+
+                if not magnet:
+                    continue
+
+                infohash = normalize_infohash(magnet)
+                if not infohash:
+                    continue
+
+                image_url = None
+                if hasattr(item, 'media_thumbnail') and item.media_thumbnail:
+                    image_url = item.media_thumbnail[0].get('url')
+                if not image_url:
+                    image_url = extract_image_url(summary) or extract_image_url(content_text)
+
+                should_check = matches_filter(title, full_desc, include_pat, exclude_pat)
+
+                new_entries.append({
+                    'infohash': infohash,
+                    'title': title,
+                    'magnet': magnet,
+                    'image_url': image_url,
+                    'summary': full_desc,
+                    'auto_check': should_check
+                })
+
+            # 合并历史
+            history_dict = load_history()
+            all_entries_dict = {}
+
+            for e in history_dict.values():
+                all_entries_dict[e['infohash']] = e
+
+            for e in new_entries:
+                all_entries_dict[e['infohash']] = e
+
+            def sort_key(e):
+                ts = e.get('timestamp')
+                if ts:
+                    return (0, -datetime.fromisoformat(ts).timestamp())
+                return (1, e['title'])
+
+            all_entries = sorted(all_entries_dict.values(), key=sort_key)
+
+            save_to_history(new_entries)
+
+            self.all_entries = all_entries
+            self.current_page = 0
+            self.root.after(0, self._render_paginated)
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("错误", f"解析失败:\n{str(e)}"))
+
+    def _render_paginated(self):
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.check_vars.clear()
+        self.entry_widgets.clear()
+        self.photo_images.clear()
+
+        start = self.current_page * PAGE_SIZE
+        end = start + PAGE_SIZE
+        page_entries = self.all_entries[start:end]
+
+        if not page_entries:
+            tk.Label(self.scrollable_frame, text="暂无数据", fg='gray').pack(pady=20)
+            self._show_pagination_controls(total_pages=0)
+            return
+
+        for entry in page_entries:
+            self.create_entry_widget(entry)
+
+        total_pages = (len(self.all_entries) + PAGE_SIZE - 1) // PAGE_SIZE
+        self._show_pagination_controls(total_pages)
+
+    def _show_pagination_controls(self, total_pages):
+        for child in self.root.winfo_children():
+            if hasattr(child, '_is_pagination'):
+                child.destroy()
+
+        if total_pages <= 1:
+            return
+
+        frame = tk.Frame(self.root)
+        frame._is_pagination = True
+        frame.pack(fill='x', padx=10, pady=5)
+
+        tk.Label(frame, text=f"第 {self.current_page + 1} / {total_pages} 页").pack(side='left')
+
+        tk.Button(frame, text="← 上一页",
+                  command=lambda: self._go_to_page(self.current_page - 1),
+                  state='normal' if self.current_page > 0 else 'disabled').pack(side='left', padx=5)
+
+        tk.Button(frame, text="下一页 →",
+                  command=lambda: self._go_to_page(self.current_page + 1),
+                  state='normal' if self.current_page < total_pages - 1 else 'disabled').pack(side='left', padx=5)
+
+    def _go_to_page(self, page):
+        self.current_page = page
+        self._render_paginated()
+
+    def create_entry_widget(self, entry):
+        infohash = entry['infohash']
+        frame = tk.Frame(self.scrollable_frame, relief='groove', bd=1, padx=5, pady=5)
+        frame.pack(fill='x', pady=4, padx=2)
+
+        var = tk.BooleanVar(value=entry['auto_check'])
+        cb = tk.Checkbutton(frame, variable=var)
+        cb.pack(side='left', padx=(0, 10))
+
+        content = tk.Frame(frame)
+        content.pack(side='left', fill='both', expand=True)
+
+        btn_frame = tk.Frame(content)
+        btn_frame.pack(anchor='ne')
+        tk.Button(btn_frame, text="🗑️", width=2, command=lambda: self.remove_entry(infohash)).pack(side='left')
+        if entry.get('image_url'):
+            tk.Button(btn_frame, text="🔄", width=2, command=lambda: self._retry_image(infohash)).pack(side='left')
+
+        img_label = None
+        if entry.get('image_url'):
+            img_container = tk.Frame(content, width=IMAGE_WIDTH, height=IMAGE_HEIGHT, bg='#eee')
+            img_container.pack_propagate(False)
+            img_container.pack(side='left', padx=(0, 10), pady=2)
+            img_label = tk.Label(img_container, bg='#eee', text="加载中…", fg='gray')
+            img_label.pack(expand=True)
+            Thread(target=self._load_image, args=(entry['image_url'], img_label), daemon=True).start()
+
+        text_frame = tk.Frame(content)
+        text_frame.pack(side='left', fill='both', expand=True, padx=(0, 10))
+        tk.Label(text_frame, text=entry['title'], font=('Arial', 10, 'bold'),
+                 wraplength=TEXT_WRAP_LENGTH, justify='left', anchor='w').pack(anchor='w', pady=(0, 3))
+        tk.Label(text_frame, text=entry['magnet'], fg='blue',
+                 wraplength=TEXT_WRAP_LENGTH, justify='left', anchor='w').pack(anchor='w')
+
+        def toggle(_): var.set(not var.get())
+        for w in [frame, content, text_frame]:
+            w.bind("<Button-1>", toggle)
+
+        self.check_vars[infohash] = var
+        self.entry_widgets[infohash] = frame
+
+    def _load_image(self, url, label):
+        try:
+            resp = requests.get(url, timeout=IMAGE_TIMEOUT)
+            resp.raise_for_status()
+            img = Image.open(BytesIO(resp.content))
+            img.thumbnail((IMAGE_WIDTH, IMAGE_HEIGHT), Image.LANCZOS)
+            tk_img = ImageTk.PhotoImage(img)
+            self.root.after(0, lambda: self._set_image(label, tk_img))
+        except Exception:
+            self.root.after(0, lambda: label.config(text="加载失败", fg='red'))
+
+    def _set_image(self, label, tk_img):
+        label.config(image=tk_img, text="")
+        self.photo_images.append(tk_img)
+
+    def _retry_image(self, infohash):
+        entry = self.entries.get(infohash)
+        if not entry or not entry['image_url']:
+            return
+        frame = self.entry_widgets.get(infohash)
+        if not frame:
+            return
+        for child in frame.winfo_children():
+            if isinstance(child, tk.Frame):
+                for sub in child.winfo_children():
+                    if isinstance(sub, tk.Frame) and sub.winfo_reqwidth() == IMAGE_WIDTH:
+                        for lbl in sub.winfo_children():
+                            if isinstance(lbl, tk.Label):
+                                lbl.config(text="重试中…", image='', fg='gray')
+                                Thread(target=self._load_image, args=(entry['image_url'], lbl), daemon=True).start()
+                                return
+
+    def remove_entry(self, infohash):
+        if infohash in self.entry_widgets:
+            self.entry_widgets[infohash].destroy()
+            del self.entry_widgets[infohash]
+        if infohash in self.check_vars:
+            del self.check_vars[infohash]
+        # 注意：不从 all_entries 删除（仅 UI 移除）
+
+    def download_selected(self):
+        selected = [
+            entry['magnet'] 
+            for ih, entry in self.entries.items() 
+            if self.check_vars.get(ih, tk.BooleanVar(value=False)).get()
+        ]
+        if not selected:
+            messagebox.showwarning("提示", "请先选择要下载的条目！")
+            return
+        Thread(target=self._download_links, args=(selected,), daemon=True).start()
+
+    def clear_history(self):
+        if messagebox.askyesno("确认", f"将删除 {HISTORY_RETENTION_DAYS} 天前的历史记录，是否继续？"):
+            Thread(target=clear_old_history, daemon=True).start()
+            messagebox.showinfo("提示", "历史清理任务已启动（后台执行）")
+
+    def _download_links(self, magnets):
+        try:
+            session = requests.Session()
+            login_data = {"username": USERNAME, "password": PASSWORD}
+            session.post(QB_LOGIN_URL, data=login_data, timeout=10)
+            for magnet in magnets:
+                body = {
+                    "urls": magnet,
+                    "savepath": '/Volumes/Storage/download/A',
+                    "rename": 'a',
+                    "autoTMM": "false"
+                }
+                session.post(QB_ADD_TORRENT_URL, data=body, timeout=10)
+            self.root.after(0, lambda: messagebox.showinfo("成功", f"{len(magnets)} 个任务已提交！"))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("错误", f"下载失败:\n{str(e)}"))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = RSSDownloaderApp(root)
+    root.mainloop()
