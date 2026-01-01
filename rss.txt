@@ -1,3 +1,15 @@
+问题1：点击下载会报错
+  > Exception in Tkinter callback
+  > Traceback (most recent call last):
+  > File "C:\Users\forma\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1948, in __call__
+  > return self.func(*args)
+  > ^^^^^^^^^^^^^^^^
+  > File "F:\pytest\rssgui.py", line 664, in download_selected
+  > selected_urls.append(entry['download_url'])
+  > ~~~~~^^^^^^^^^^^^^^^^
+  > KeyError: 'download_url'
+
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 import feedparser
@@ -16,23 +28,18 @@ from datetime import datetime
 QB_LOGIN_URL = "http://192.168.50.3:8080/api/v2/auth/login"
 QB_ADD_TORRENT_URL = "http://192.168.50.3:8080/api/v2/torrents/add"
 USERNAME = "admin"
-PASSWORD = "1234qwer"
+PASSWORD = "xxx"  # ← 替换为你的密码！
 
 PRESET_RSS = {
     "mikanime": {
         "url": "https://mikanime.tv/RSS/MyBangumi?token=2iwXTp1m89Rxj92aJIfIrA%3d%3d",
-        "include": r"",
-        "exclude": r""
+        "include": r"1月|新番|ani",
+        "exclude": r"英语|巴哈"
     },
     "moe": {
-        "url": "https://www.anix.moe/rss.xml",
-        "include": r"黑丝|肉丝|白丝|灰丝|丝袜|萝莉|絲襪|黑絲|肉絲|襪|足|美脚|美腿|JK|连裤袜|JUQ|WAAA|パンスト|SSIS|IPZZ",
-        "exclude": r"熟女|C107|同人誌|AMSR"
-    },
-    "eht": {
-        "url": "https://e-hentai.org/rss/ehtracker.xml",
-        "include": r"中国|中国翻訳|汉化|翻译|Chinese|漢化|萝莉|JK",
-        "exclude": r""
+        "url": "https://192.168.50.4/rss.xml",
+        "include": r"中文",
+        "exclude": r"英文"
     },
 }
 
