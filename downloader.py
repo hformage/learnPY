@@ -671,18 +671,19 @@ def down_batch_mode3_queue(task_queue, offset=0):
                 # 检查是否应该跳过
                 if downloader._should_skip_tag(tag):
                     downloader.log(f'Skip tag {tag}')
-                    continue
+                    done_tags.append(tag)
+                else:
                 
-                # 获取当前页数用于日志
-                file_counter = downloader._get_max_file_num()
-                downloader.log(f'Tag({offset})/({processed_count}): {file_counter} {tag}')
-                
-                # 下载这个tag的新图片（使用skip逻辑）
-                result = downloader._download_tag_batch(tag, offset, processed_count)
-                
-                # 不管是否有新下载，只要处理过就加入done_tags
-                # 这样才能在tags.txt中把处理过的tag移到最后
-                done_tags.append(tag)
+                    # 获取当前页数用于日志
+                    file_counter = downloader._get_max_file_num()
+                    downloader.log(f'Tag({offset})/({processed_count}): {file_counter} {tag}')
+                    
+                    # 下载这个tag的新图片（使用skip逻辑）
+                    result = downloader._download_tag_batch(tag, offset, processed_count)
+                    
+                    # 不管是否有新下载，只要处理过就加入done_tags
+                    # 这样才能在tags.txt中把处理过的tag移到最后
+                    done_tags.append(tag)
             finally:
                 # 确保任务标记为完成 (#16修复死锁风险)
                 task_queue.task_done()

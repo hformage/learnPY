@@ -126,20 +126,34 @@ class ThumbnailMaker:
             return None
     
     def delete_old_thumbnails(self):
-        """删除该tag的所有旧缩略图"""
+        """删除该tag的所有旧缩略图
+        
+        文件名格式: tag_id_name.jpg
+        通过找到最后两个下划线来提取tag名称
+        """
         deleted_count = 0
-        prefix = self.tag + '_'
-        prefix_len = len(prefix)
         
         try:
             with os.scandir(self.target_dir) as entries:
                 for entry in entries:
+                    if not entry.is_file() or not entry.name.lower().endswith('.jpg'):
+                        continue
+                    
                     name = entry.name
-                    if (entry.is_file() and 
-                        name.startswith(prefix) and 
-                        name.lower().endswith('.jpg') and
-                        len(name) > prefix_len and 
-                        name[prefix_len].isdigit()):
+                    # 找到最后两个下划线的位置
+                    last_underscore = name.rfind('_')
+                    if last_underscore == -1:
+                        continue
+                    
+                    second_last_underscore = name.rfind('_', 0, last_underscore)
+                    if second_last_underscore == -1:
+                        continue
+                    
+                    # 提取tag名称（从开头到倒数第二个下划线之前）
+                    file_tag = name[:second_last_underscore]
+                    
+                    # 如果tag匹配，删除文件
+                    if file_tag == self.tag:
                         try:
                             os.remove(entry.path)
                             deleted_count += 1
