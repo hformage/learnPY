@@ -1,0 +1,6 @@
+修改代码，把mode=3的zzztag1.start-zzztag6.start合并成一个zzztag.start，taglog1-6.txt还是继续保持,修改现有的多线程逻辑，所有线程都检查zzztag.start，并且在文件被删掉后停止，taglog还是按自己的编号写自己的，db逻辑也保持原样，但是修改获取tag的逻辑，每个线程只获取100个tag，获取完成后结束当前下载并返回数据给main，让main写入db，然后自己再开启一个新的下载线程获取下100个，这样可以避免一个线程堆积了太多数据返回给main的时候数据量很大，前面分阶段每100个tag提交给main一次再继续下载，再对analyze_log进行优化，运行analyze_log默认从数据库分析60天的数据，但是现在的的log如下
+2026-01-04: 115 | 166 | 489.58 MB | 2.95 MB
+我需要在时间后面，tag_count前面加一个今天查询过的tag count，比如今天查询了500个tag，只有115个tag有下载，结果就应该是下面的
+2026-01-04: 500 | 115 | 166 | 489.58 MB | 2.95 MB
+这个数据可以在main的print(f"  已处理: {len(stats['all_done_tags'])}/{stats['total_tags']} 个tag")找到，你看是需要在db里面新增一个download_daily_record来记录还是可以直接从taglog1-6里面提取出当天的log总数，看哪个更方便更效率来选择
+你需要以专业的眼光分析我上面的需求是否合理，是否有更合理和可以改善的地方，分析完成后再进行优化
