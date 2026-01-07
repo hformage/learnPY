@@ -1,0 +1,18 @@
+  > Exception in Tkinter callback
+  > Traceback (most recent call last):
+  > File "C:\Users\forma\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1948, in __call__
+  > return self.func(*args)
+  > ^^^^^^^^^^^^^^^^
+  > File "C:\Users\forma\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 861, in callit
+  > func(*args)
+  > File "F:\pytest\rssgui.py", line 995, in <lambda>
+  > self.root.after(0, lambda: self._set_image(label, tk_img))
+  > ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  > File "F:\pytest\rssgui.py", line 1001, in _set_image
+  > label.config(image=tk_img, text="")
+  > File "C:\Users\forma\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1702, in configure
+  > return self._configure('configure', cnf, kw)
+  > ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  > File "C:\Users\forma\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1692, in _configure
+  > self.tk.call(_flatten((self._w, cmd)) + self._options(cnf))
+  > _tkinter.TclError: invalid command name ".!frame2.!canvas.!frame.!frame57.!frame.!frame2.!label"
