@@ -225,9 +225,12 @@ def handle_result(result):
     if result.get('set_input_done'):
         set_tag.set_input_done(result['set_input_done'])
     
-    # 6. 删除启动文件
-    if result.get('remove_startfile') and os.path.exists(result.get('remove_startfile')):
-        os.remove(result['remove_startfile'])
+    # 6. 删除启动文件（不删除mode=3的统一启动文件）
+    startfile = result.get('remove_startfile')
+    if startfile and os.path.exists(startfile):
+        # 不删除 zzztag.start（mode=3的统一启动文件）
+        if not startfile.endswith('zzztag.start'):
+            os.remove(startfile)
     
     # 7. 添加过期tag
     if result.get('expire_tags'):
@@ -274,16 +277,8 @@ def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_t
             # 创建统一启动文件
             with open(unified_start, 'w') as f:
                 f.write('')
-        else:
-            end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
-            running = len(end_files)
-            workers = 6
-            
-            if running >= workers:
-                print(f"已有{running}个任务运行中，无法启动新任务")
-                return {}
         
-        # 3. 计算可用线程数
+        # 3. 固定使用6个线程
         workers = 6
         available = workers
         print(f"可用线程: {available}")
@@ -455,7 +450,7 @@ def mode_1():
         
         tags_config = set_tag.read_tagjson()
         
-        # 清理孤立的 .start 文件
+        # 清理孤立的 .start 文件(排除mode=3的zzztag.start)
         new_path = config['path']['new']
         start_files = glob.glob(os.path.join(new_path, '*.start'))
         
@@ -467,6 +462,8 @@ def mode_1():
                 active_tags.add(f'zzz{replace_tag}.start')
                 active_tags.add(f'{tag}.start')
                 active_tags.add(f'zzztag{replace_tag}.start')
+            
+            active_tags.add('zzztag.start')
             
             # 清理不属于活跃 tag 的 .start 文件
             cleaned = 0
@@ -560,7 +557,7 @@ def mode_1():
                         
                         #记录tag数
                         db = get_database()
-                        today = datetime.now().strftime("%Y-%m-%d")
+                        today = datetime.datetime.now().strftime("%Y-%m-%d")
                         db.record_daily_query(today, 1)
 
                         print(f"✓ [{completed_count}] {tag} 完成")
