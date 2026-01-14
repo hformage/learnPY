@@ -579,6 +579,11 @@ class Downloader:
         # 整理tags.txt - 直接在线程中执行
         set_tag.update_tags(self.replace_tag, None, 'u')
         
+        #记录每日查询数量
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        self.db.record_daily_query(today, 1)
+
         # 输出这个tag的统计
         if downloaded_this_tag > 0:
             size_str = format_size(total_size_this_tag)
@@ -612,7 +617,7 @@ def down_single(tag, tagjs):
     return downloader.download_single(tag, tagjs)
 
 
-def down_batch_mode3_queue(task_queue, offset=0):
+def down_batch_mode3_queue(task_queue, offset=0, result_queue=None):
     """
     Mode 3 队列版本（从任务队列中取tag下载）
     
@@ -620,29 +625,39 @@ def down_batch_mode3_queue(task_queue, offset=0):
     - 动态任务分配：工作线程从共享队列取tag
     - 自动负载均衡：完成快的线程处理更多任务
     - 线程安全：queue.Queue 保证并发安全
-    - 每个线程有独立的 .start 文件，删除对应文件只停止对应线程
+    - 统一启动控制：所有线程检查 zzztag.start
+    - 增量提交：每处理20个tag提交一次数据
     
     Args:
         task_queue: queue.Queue 实例，包含待处理的tag
         offset: 线程编号
+        result_queue: 结果队列，用于增量提交数据
     
     Returns:
         dict: 收集的所有数据
     """
     downloader = Downloader()
     downloader.init_batch(offset)
+    
+    # 使用统一的启动文件：zzztag.start
+    unified_startfile = os.path.join(config['path']['new'], 'zzztag.start')
+    downloader.startfile = unified_startfile
+    
     downloader.log('Start')
     
-    # 创建启动文件
-    with open(downloader.startfile, 'w') as f:
-        f.write('')
+    # 只有第一个线程创建启动文件
+    if offset == 1 and not os.path.exists(unified_startfile):
+        with open(unified_startfile, 'w') as f:
+            f.write('')
     
     done_tags = []
     processed_count = 0
     interrupted = False  # 标记是否被中断
+    batch_submit_count = 0  # 批量提交计数器
+    BATCH_SIZE = 20  # 每20个tag提交一次
     
     while True:
-        # 先检查自己的启动文件（在取任务前检查，快速响应中断）
+        # 先检查统一的启动文件（在取任务前检查，快速响应中断）
         if not downloader._chk_start():
             downloader.log(f'Start file deleted, exiting...')
             interrupted = True
@@ -684,6 +699,36 @@ def down_batch_mode3_queue(task_queue, offset=0):
                     # 不管是否有新下载，只要处理过就加入done_tags
                     # 这样才能在tags.txt中把处理过的tag移到最后
                     done_tags.append(tag)
+                
+                # 更新批量提交计数
+                batch_submit_count += 1
+                
+                # 每处理BATCH_SIZE个tag，提交一次数据
+                if result_queue and batch_submit_count >= BATCH_SIZE:
+                    intermediate_result = {
+                        'type': 'intermediate',
+                        'offset': offset,
+                        'tag_time': downloader.result['tag_time'].copy(),
+                        'failed_records': downloader.result['failed_records'].copy(),
+                        'downloaded_files': downloader.result['downloaded_files'].copy(),
+                        'done_tags': done_tags.copy(),
+                        'statistics': {
+                            'downloaded': downloader.downed_cnt,
+                            'failed': downloader.failed_cnt,
+                            'total_size': downloader.total_download_size
+                        }
+                    }
+                    result_queue.put(intermediate_result)
+                    
+                    # 清空已提交的数据
+                    downloader.result['tag_time'] = {}
+                    downloader.result['failed_records'] = []
+                    downloader.result['downloaded_files'] = []
+                    done_tags = []
+                    batch_submit_count = 0
+                    
+                    downloader.log(f'Submitted intermediate result ({BATCH_SIZE} tags)')
+                
             finally:
                 # 确保任务标记为完成 (#16修复死锁风险)
                 task_queue.task_done()
@@ -703,9 +748,8 @@ def down_batch_mode3_queue(task_queue, offset=0):
                pass
             continue
     
-    # 删除启动文件
-    if downloader._chk_start():
-        downloader.result['remove_startfile'] = downloader.startfile
+    # 不删除统一启动文件（由main统一管理）
+    # 统一的启动文件应该由主线程在所有工作线程完成后删除
     
     # 输出统计信息（与旧代码格式一致）
     if downloader.downed_cnt > 0:
@@ -731,17 +775,20 @@ def down_batch_mode3_queue(task_queue, offset=0):
     # 收集完成的tag列表和中断标志
     downloader.result['done_tags'] = done_tags
     downloader.result['interrupted'] = interrupted
+    downloader.result['type'] = 'final'
+    downloader.result['offset'] = offset
     
     return downloader.result
 
 
-def _batch_queue_worker(task_queue, offset, mode_name, tag_processor, stat_keys):
+def _batch_queue_worker(task_queue, offset, result_queue, mode_name, tag_processor, stat_keys):
     """
     通用批量队列工作函数（Mode 6/7 公共逻辑）
     
     Args:
         task_queue: 任务队列
         offset: 线程编号
+        result_queue: 结果队列（Mode 6/7不使用，保持签名一致）
         mode_name: 模式名称（用于日志）
         tag_processor: 处理单个tag的函数 (downloader, tag) -> tuple of stats
         stat_keys: 统计键名列表，如 ['added', 'updated', 'skipped']
@@ -829,24 +876,27 @@ def _batch_queue_worker(task_queue, offset, mode_name, tag_processor, stat_keys)
     downloader.result['statistics'] = stats
     downloader.result['processed_count'] = processed_count
     downloader.result['interrupted'] = interrupted
+    downloader.result['type'] = 'final'
+    downloader.result['offset'] = offset
     
     return downloader.result
 
 
-def update_batch_mode6_queue(task_queue, offset):
+def update_batch_mode6_queue(task_queue, offset, result_queue=None):
     """Mode 6: 更新图片信息（不下载，只对比并更新DB）"""
     return _batch_queue_worker(
-        task_queue, offset, 
+        task_queue, offset, result_queue,
         mode_name="Update",
         tag_processor=_update_tag_info,
         stat_keys=['added', 'updated', 'skipped']
     )
 
 
-def update_batch_mode7_queue(task_queue, offset):
+
+def update_batch_mode7_queue(task_queue, offset, result_queue=None):
     """Mode 7: 从本地 tags.txt 读取信息写入数据库（不联网）"""
     return _batch_queue_worker(
-        task_queue, offset,
+        task_queue, offset, result_queue,
         mode_name="Import",
         tag_processor=_import_from_tags_txt,
         stat_keys=['added', 'skipped', 'not_found']

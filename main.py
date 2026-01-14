@@ -243,7 +243,7 @@ def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_t
     
     Args:
         mode_name: 模式名称（用于日志）
-        worker_func: 工作函数 (task_queue, offset) -> result
+        worker_func: 工作函数 (task_queue, offset, result_queue) -> result
         result_handler: 可选的结果处理函数 (result, stats_collector) -> None
         collect_tag_time: 是否收集 tag_time（Mode 3需要）
     
@@ -265,18 +265,28 @@ def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_t
         
         print(f"总标签数: {len(taglist)}")
         
-        # 2. 检查运行中的任务
-        end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
-        running = len(end_files)
-        workers = 6
-        
-        if running >= workers:
-            print(f"已有{running}个任务运行中，无法启动新任务")
-            return {}
+        # 2. 检查运行中的任务（Mode 3使用统一启动文件）
+        if mode_name.startswith("Mode 3"):
+            unified_start = os.path.join(config['path']['new'], 'zzztag.start')
+            if os.path.exists(unified_start):
+                print(f"已有Mode 3任务运行中（zzztag.start存在），无法启动新任务")
+                return {}
+            # 创建统一启动文件
+            with open(unified_start, 'w') as f:
+                f.write('')
+        else:
+            end_files = glob.glob(os.path.join(config['path']['new'], "*.start"))
+            running = len(end_files)
+            workers = 6
+            
+            if running >= workers:
+                print(f"已有{running}个任务运行中，无法启动新任务")
+                return {}
         
         # 3. 计算可用线程数
-        available = workers - running
-        print(f"运行中任务: {running}, 可用线程: {available}/{workers}")
+        workers = 6
+        available = workers
+        print(f"可用线程: {available}")
         
         # 4. 创建任务队列并填充
         task_queue = queue.Queue()
@@ -304,48 +314,93 @@ def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_t
         
         start_time = time.time()
         
-        # 7. 启动工作线程
+        # 7. 创建结果队列（用于增量提交）
+        result_queue = queue.Queue()
+        
+        # 8. 启动工作线程
         with concurrent.futures.ThreadPoolExecutor(max_workers=available) as executor:
-            futures = {executor.submit(worker_func, task_queue, i+1): i+1 
+            futures = {executor.submit(worker_func, task_queue, i+1, result_queue): i+1 
                       for i in range(available)}
             
-            # 8. 收集结果
-            for future in concurrent.futures.as_completed(futures):
-                offset = futures[future]
-                try:
-                    result = future.result()
-                    
-                    # 通用结果处理
+            # 9. 收集结果（同时处理增量结果）
+            completed_threads = 0
+            while completed_threads < available:
+                # 先处理增量结果
+                while not result_queue.empty():
+                    try:
+                        intermediate = result_queue.get_nowait()
+                        if intermediate.get('type') == 'intermediate':
+                            # 处理增量数据
+                            if result_handler:
+                                result_handler(intermediate, stats_collector)
+                            
+                            # 更新统计
+                            stats_collector['all_tag_time'].update(intermediate.get('tag_time', {}))
+                            stats_collector['all_done_tags'].extend(intermediate.get('done_tags', []))
+                            stats = intermediate.get('statistics', {})
+                            stats_collector['total_downloaded'] += stats.get('downloaded', 0)
+                            stats_collector['total_failed'] += stats.get('failed', 0)
+                            stats_collector['total_size'] += stats.get('total_size', 0)
+                    except queue.Empty:
+                        break
+                
+                # 检查是否有线程完成
+                done_futures = [f for f in futures if f.done()]
+                for future in done_futures:
+                    offset = futures[future]
+                    try:
+                        result = future.result()
+                        
+                        # 只处理最终结果
+                        if result.get('type') == 'final':
+                            # 处理最终结果
+                            if result_handler:
+                                result_handler(result, stats_collector)
+                            
+                            # 汇总统计
+                            stats_collector['all_tag_time'].update(result.get('tag_time', {}))
+                            stats_collector['all_done_tags'].extend(result.get('done_tags', []))
+                            
+                            stats = result.get('statistics', {})
+                            stats_collector['total_downloaded'] += stats.get('downloaded', 0)
+                            stats_collector['total_failed'] += stats.get('failed', 0)
+                            stats_collector['total_size'] += stats.get('total_size', 0)
+                            stats_collector['total_added'] += stats.get('added', 0)
+                            stats_collector['total_updated'] += stats.get('updated', 0)
+                            stats_collector['total_skipped'] += stats.get('skipped', 0)
+                            stats_collector['total_not_found'] += stats.get('not_found', 0)
+                            
+                            print(f"\n线程 {offset} 已完成")
+                        
+                        completed_threads += 1
+                        futures.pop(future)
+                        
+                    except Exception as e:
+                        print(f"\n线程 {offset} 执行出错: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        completed_threads += 1
+                
+                # 短暂休眠，避免CPU空转
+                time.sleep(0.1)
+        
+        # 10. 处理剩余的增量结果
+        while not result_queue.empty():
+            try:
+                intermediate = result_queue.get_nowait()
+                if intermediate.get('type') == 'intermediate':
                     if result_handler:
-                        result_handler(result, stats_collector)
-                    else:
-                        handle_result(result)
-                    
-                    # 合并tag_time（Mode 3）
-                    if collect_tag_time and result.get('tag_time'):
-                        stats_collector['all_tag_time'].update(result['tag_time'])
-                    
-                    if result.get('done_tags'):
-                        stats_collector['all_done_tags'].extend(result['done_tags'])
-                    
-                    # 收集统计数据
-                    stats = result.get('statistics', {})
+                        result_handler(intermediate, stats_collector)
+                    stats_collector['all_tag_time'].update(intermediate.get('tag_time', {}))
+                    stats_collector['all_done_tags'].extend(intermediate.get('done_tags', []))
+                    stats = intermediate.get('statistics', {})
                     stats_collector['total_downloaded'] += stats.get('downloaded', 0)
                     stats_collector['total_failed'] += stats.get('failed', 0)
                     stats_collector['total_size'] += stats.get('total_size', 0)
-                    stats_collector['total_added'] += stats.get('added', 0)
-                    stats_collector['total_updated'] += stats.get('updated', 0)
-                    stats_collector['total_skipped'] += stats.get('skipped', 0)
-                    stats_collector['total_not_found'] += stats.get('not_found', 0)
-                    
-                    done_count = result.get('processed_count', len(result.get('done_tags', [])))
-                    interrupted_msg = " (interrupted)" if result.get('interrupted') else ""
-                    print(f"✓ 线程{offset} 完成: {done_count} 个tag{interrupted_msg}")
-                    
-                except Exception as e:
-                    print(f"✗ 线程{offset} 出错: {e}")
+            except queue.Empty:
+                break
         
-        # 9. 清空队列中可能残留的任务
+        # 11. 清空任务队列中可能残留的任务
         remaining = 0
         while not task_queue.empty():
             try:
@@ -355,6 +410,15 @@ def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_t
                 break
         if remaining > 0:
             print(f"⚠ 清理了 {remaining} 个未处理的队列任务")
+        
+        # 12. 删除统一启动文件（仅Mode 3）
+        if mode_name.startswith("Mode 3"):
+            unified_start = os.path.join(config['path']['new'], 'zzztag.start')
+            if os.path.exists(unified_start):
+                try:
+                    os.remove(unified_start)
+                except Exception as e:
+                    print(f"⚠️  删除启动文件失败: {e}")
         
         stats_collector['elapsed_minutes'] = (time.time() - start_time) / 60
         stats_collector['total_tags'] = len(taglist)
@@ -366,6 +430,7 @@ def _run_batch_queue_mode(mode_name, worker_func, result_handler=None, collect_t
             get_database().close_all_connections()
         except Exception as e:
             print(f"⚠️  关闭数据库连接失败: {e}")
+
 
 
 def mode_1():
@@ -493,6 +558,11 @@ def mode_1():
                         total_failed += stats.get('failed', 0)
                         total_size += stats.get('total_size', 0)
                         
+                        #记录tag数
+                        db = get_database()
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        db.record_daily_query(today, 1)
+
                         print(f"✓ [{completed_count}] {tag} 完成")
                         
                     except Exception as e:
@@ -514,6 +584,7 @@ def mode_1():
             if all_tag_time:
                 write_tag_time(all_tag_time)
             
+
             # 打印汇总统计
             print_summary_statistics(total_downloaded, total_failed, total_size)
     

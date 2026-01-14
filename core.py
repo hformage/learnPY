@@ -459,7 +459,18 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_pictures_tag_name ON pictures(tag_name)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_pictures_pic_id ON pictures(pic_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_pictures_filename ON pictures(filename)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_pictures_download_time ON pictures(download_time)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_tag_progress_status ON tag_progress(status)')
+            
+            # 4. 每日查询统计表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_query_stats (
+                    query_date TEXT PRIMARY KEY,
+                    queried_count INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_query_date ON daily_query_stats(query_date)')
     
     # ============ 图片操作 ============
     
@@ -740,6 +751,58 @@ class DatabaseManager:
             """, values)
             return cursor.rowcount > 0
     
+        # ============ 每日查询统计 ============
+    
+    def record_daily_query(self, query_date: str, queried_count: int):
+        """
+        记录每日查询的tag总数（累加模式，支持Mode 1和Mode 3）
+        
+        Args:
+            query_date: 日期，格式 YYYY-MM-DD
+            queried_count: 本次查询的tag数量
+        """
+        with self.get_cursor() as cursor:
+            # 先查询是否已有记录
+            cursor.execute(
+                'SELECT queried_count FROM daily_query_stats WHERE query_date=?',
+                (query_date,)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                # 累加到现有记录
+                new_count = row['queried_count'] + queried_count
+                cursor.execute("""
+                    UPDATE daily_query_stats 
+                    SET queried_count=? 
+                    WHERE query_date=?
+                """, (new_count, query_date))
+            else:
+                # 创建新记录
+                cursor.execute("""
+                    INSERT INTO daily_query_stats (query_date, queried_count)
+                    VALUES (?, ?)
+                """, (query_date, queried_count))
+    
+    def get_daily_query_count(self, query_date: str) -> int:
+        """
+        获取指定日期查询的tag总数
+        
+        Args:
+            query_date: 日期，格式 YYYY-MM-DD
+        
+        Returns:
+            查询的tag总数，如果没有记录返回0
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                'SELECT queried_count FROM daily_query_stats WHERE query_date=?',
+                (query_date,)
+            )
+            row = cursor.fetchone()
+            return row['queried_count'] if row else 0
+    
+
     def close_all_connections(self):
         """关闭所有连接"""
         if hasattr(self._thread_local, 'connection'):

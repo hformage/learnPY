@@ -60,17 +60,27 @@ def analyze_from_db(days=60):
         # 按日期统计
         cursor.execute("""
             SELECT 
-                pic_date,
+                DATE(download_time) as download_date,
                 COUNT(DISTINCT tag_name) as tag_count,
                 COUNT(*) as file_count,
                 SUM(file_size) as total_size
             FROM pictures
-            WHERE pic_date >= ?
-            GROUP BY pic_date
-            ORDER BY pic_date
+            WHERE DATE(download_time) >= ?
+            GROUP BY DATE(download_time)
+            ORDER BY download_time
         """, (cutoff_date,))
         
         results = cursor.fetchall()
+        
+        # 获取每日查询tag数
+        cursor.execute("""
+            SELECT query_date, queried_count
+            FROM daily_query_stats
+            WHERE query_date >= ?
+            ORDER BY query_date
+        """, (cutoff_date,))
+        
+        query_stats = {row['query_date']: row['queried_count'] for row in cursor.fetchall()}
         
         if not results:
             print("没有找到符合条件的记录")
@@ -80,13 +90,15 @@ def analyze_from_db(days=60):
         grand_total_size = 0
         
         for row in results:
-            date = row['pic_date']
+            date = row['download_date']
+            queried_count = query_stats.get(date, 0)
             tag_count = row['tag_count']
             file_count = row['file_count']
             total_size = row['total_size'] or 0
             avg_size = total_size / file_count if file_count else 0
             
-            print(f"{date}: {tag_count} | {file_count} | {format_size(total_size)} | {format_size(avg_size)}")
+            # 新格式：日期 | 查询tag数 | 有下载tag数 | 文件数 | 总大小 | 平均大小
+            print(f"{date}: {queried_count} | {tag_count} | {file_count} | {format_size(total_size)} | {format_size(avg_size)}")
             
             grand_total_files += file_count
             grand_total_size += total_size
