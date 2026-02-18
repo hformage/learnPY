@@ -307,7 +307,7 @@ class Downloader:
             self.log(f'page start: {page}/{tag_config["endpage"]} {url}')
             total_images = len(image_urls)
             self.log(f'Total get {total_images}')
-            
+
             # 遍历图片
             for i, (img_url, img_id) in enumerate(zip(image_urls, image_ids), 1):
                 # 更新当前进度（用于中断恢复）
@@ -354,7 +354,7 @@ class Downloader:
                     set_tag.update_tags(self.replace_tag, f"{tag}|{pic_time}|{pic_filename}|{pic_id}|{pic_tags}")
                 else:
                     # 下载图片
-                    image_content = self.web.download_image(pic_url, retries=50)
+                    image_content = self.web.download_image(pic_url, referer=img_url, retries=50)
                     
                     if not image_content:
                         self.failed_cnt += 1
@@ -530,7 +530,7 @@ class Downloader:
                     skip_count = 0  # 重置skip计数
                     
                     # 下载图片
-                    image_content = self.web.download_image(pic_url, retries=50)
+                    image_content = self.web.download_image(pic_url, referer=img_url, retries=50)
                     
                     if not image_content:
                         self.failed_cnt += 1

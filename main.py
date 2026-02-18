@@ -815,10 +815,196 @@ def mode_7():
     print(f"{'='*50}\n")
 
 
+def mode_0(tag: str):
+    """
+    调试模式0: 分析下载流程问题
+    
+    功能:
+    - 不创建目录和下载文件
+    - 获取第一页的列表页面信息
+    - 记录页面URL、HTML内容片段、匹配模式和结果到check.log
+    - 对第一个图片页面进行详细分析
+    
+    使用方法: python main.py 0 {tag}
+    
+    Args:
+        tag: 要调试的标签名
+    """
+    import requests
+    from bs4 import BeautifulSoup
+    import re
+    import json
+    import os
+    import time
+    from urllib.parse import urljoin
+    
+    print(f"\n=== Mode 0: Debug Analysis for tag '{tag}' ===\n")
+    
+    # 创建check.log文件
+    log_path = os.path.join(os.path.dirname(__file__), 'check.log')
+    
+    with open(log_path, 'w', encoding='utf-8') as logf:
+        def log(msg):
+            """同时打印到控制台和写入日志文件"""
+            print(msg)
+            logf.write(msg + '\n')
+        
+        # 记录开始时间
+        start_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        log(f"[{start_time}] 开始调试标签: {tag}")
+        log("=" * 60)
+        
+        # 1. 构造基础URL和配置
+        base_url = config['url']
+        headers = config['headers']
+        
+        log(f"基础URL: {base_url}")
+        log(f"Headers: {json.dumps(headers, indent=2, ensure_ascii=False)}")
+        log("")
+        
+        # 2. 测试第一页（pid=0）
+        page_url = f"{base_url}{tag}"
+        log(f"==== 第 1 页 ====")
+        log(f"URL: {page_url}")
+        log("-" * 40)
+        
+        # 获取页面内容
+        try:
+            response = requests.get(page_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            html_content = response.text
+            
+            log(f"✓ 请求成功，状态码: {response.status_code}")
+            log(f"✓ 页面大小: {len(html_content)} 字符")
+            
+            # 保存完整的HTML内容到日志
+            log("\n--- 完整HTML内容 ---")
+            log(html_content[:2000])  # 只记录前2000字符避免文件过大
+            log("--- HTML内容结束 ---\n")
+            
+            # 解析HTML
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # 测试图片列表提取
+            log("尝试提取图片列表:")
+            
+            # 方法1: 使用get_image_list方法逻辑
+            try:
+                image_urls_method1 = []
+                articles = soup.find_all('article')
+                for article in articles:
+                    links = article.find_all('a')
+                    if links:
+                        href = links[0].get('href', '')
+                        if href:
+                            image_urls_method1.append(href)
+            
+                log(f"方法1 (find_all article): 找到 {len(image_urls_method1)} 个图片链接")
+                for i, url in enumerate(image_urls_method1[:3]):  # 只显示前3个
+                    log(f"  {i+1}. {url}")
+            except Exception as e:
+                log(f"方法1失败: {e}")
+            
+            # 方法2: 使用正则表达式匹配
+            try:
+                # 修改正则表达式以匹配HTML实体编码的&amp;符号
+                pattern = re.compile(r'href=["\'](index\.php\?page=post&(?:amp;)?s=view&(?:amp;)?id=\d+&(?:amp;)?tags=[^"\']*)["\']')
+                matches = pattern.findall(html_content)
+                unique_matches = list(set(matches))  # 去重
+                
+                log(f"\n方法2 (正则表达式): 找到 {len(unique_matches)} 个唯一链接")
+                for i, match in enumerate(unique_matches[:3]):
+                    full_url = urljoin(base_url, match)
+                    log(f"  {i+1}. {full_url}")
+                    
+                log(f"\n正则表达式模式: {pattern.pattern}")
+            except Exception as e:
+                log(f"方法2失败: {e}")
+
+            # 3. 对第一个图片进行详细分析
+            if unique_matches:
+                img_path = unique_matches[0]
+                img_url = urljoin(base_url, img_path)
+                log(f"\n==== 分析第一个图片: {img_url} ====")
+                
+                try:
+                    img_response = requests.get(img_url, headers=headers, timeout=15)
+                    img_response.raise_for_status()
+                    img_html = img_response.text
+                    img_soup = BeautifulSoup(img_html, 'html.parser')
+                    
+                    log(f"✓ 图片页面获取成功，大小: {len(img_html)} 字符")
+                    
+                    # 提取图片ID
+                    img_id_match = re.search(r'id=(\d+)', img_path)
+                    img_id = img_id_match.group(1) if img_id_match else "unknown"
+                    log(f"图片ID: {img_id}")
+                    
+                    # 提取标签
+                    try:
+                        tags_found = []
+                        # 查找标签div
+                        tag_elements = img_soup.find_all('li', class_=re.compile(r'tag-type-'))
+                        for tag_elem in tag_elements:
+                            tag_link = tag_elem.find('a', class_='search-tag')
+                            if tag_link:
+                                tags_found.append(tag_link.text.strip())
+                    
+                        # 从标题提取
+                        if img_soup.title and img_soup.title.string:
+                            title_part = img_soup.title.string.split('- Image View -')[0].strip()
+                            if title_part and '|' in title_part:
+                                title_tags = [t.strip() for t in title_part.split('|')]
+                                tags_found.extend(title_tags)
+                    
+                        # 去重
+                        unique_tags = list(dict.fromkeys(tags_found))[:5]
+                        log(f"找到标签 ({len(unique_tags)}个): {', '.join(unique_tags)}")
+                    except Exception as e:
+                        log(f"标签提取失败: {e}")
+                    
+                    # 提取下载链接
+                    try:
+                        download_links = []
+                        # 查找highres链接
+                        highres_link = img_soup.find('a', id='highres')
+                        if highres_link and highres_link.get('href'):
+                            download_links.append(('highres', highres_link['href']))
+                    
+                        # 查找og:image
+                        og_image = img_soup.find('meta', property='og:image')
+                        if og_image and og_image.get('content'):
+                            download_links.append(('og:image', og_image['content']))
+                    
+                        log(f"找到下载链接 ({len(download_links)}个):")
+                        for link_type, link_url in download_links:
+                            log(f"  {link_type}: {link_url}")
+                            
+                    except Exception as e:
+                        log(f"下载链接提取失败: {e}")
+                    
+                except Exception as e:
+                    log(f"✗ 图片页面获取失败: {e}")
+            else:
+                log("未找到任何图片链接")
+            
+        except Exception as e:
+            log(f"✗ 页面请求失败: {e}")
+        
+        # 4. 总结
+        end_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        log(f"\n[{end_time}] 调试完成")
+        log("=" * 60)
+    
+    print(f"\n✓ 调试日志已保存到: {log_path}")
+    print("请检查check.log文件以分析问题所在")
+
+
 def main():
     """主函数"""
     if len(sys.argv) < 2:
-        print("使用方法: python main.py [1|3|4|5|6|7]")
+        print("使用方法: python main.py [0|1|3|4|5|6|7]")
+        print("  0 - 调试模式（分析下载问题，不下载文件）")
         print("  1 - 下载新标签（自动恢复中断）")
         print("  3 - 下载所有旧标签")
         print("  4 - 清理已完成记录")
@@ -830,7 +1016,12 @@ def main():
     mode = sys.argv[1]
     
     try:
-        if mode == '1':
+        if mode == '0':
+            if len(sys.argv) < 3:
+                print("Mode 0 需要指定标签名: python main.py 0 {tag}")
+                return
+            mode_0(sys.argv[2])
+        elif mode == '1':
             mode_1()
         elif mode == '3':
             mode_3()
@@ -847,7 +1038,7 @@ def main():
             mode_7()
         else:
             print(f"未知模式: {mode}")
-            print("可用模式: 1, 3, 4, 5, 6, 7")
+            print("可用模式: 0, 1, 3, 4, 5, 6, 7")
     finally:
         print("\n所有任务完成")
 
