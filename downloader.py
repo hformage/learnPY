@@ -309,7 +309,10 @@ class Downloader:
             self.log(f'Total get {total_images}')
 
             # 遍历图片
+            from urllib.parse import urljoin
             for i, (img_url, img_id) in enumerate(zip(image_urls, image_ids), 1):
+                # 确保img_url为绝对url
+                img_url_abs = urljoin(self.base_url, img_url)
                 # 更新当前进度（用于中断恢复）
                 self.tag_config['startpage'] = page
                 self.tag_config['start_pic'] = i
@@ -332,13 +335,15 @@ class Downloader:
                     file_counter = self._get_max_file_num()
                 
                 # 获取详情页
-                detail_soup = self.web.get_soup(img_url, retries=50)
+                detail_soup = self.web.get_soup(img_url_abs, retries=50)
                 if not detail_soup:
                     continue
-                
                 pic_time, pic_date, pic_id, pic_url, pic_tags, pic_filename = self._extract_metadata(detail_soup)
                 if not pic_filename:
                     continue
+                # 确保pic_url为绝对url
+                if pic_url and not pic_url.startswith('http'):
+                    pic_url = urljoin(self.base_url, pic_url)
                 
                 # 记录最新的图片时间
                 self._add_downloadtag(tag, pic_time)
@@ -350,12 +355,10 @@ class Downloader:
                 # 检查是否已存在
                 if os.path.exists(original_save_path):
                     self.log(f'{i}/{total_images} skip {pic_filename} {pic_time}')
-                    # 直接写入tag自己的tags.txt（每个线程处理不同tag，无冲突）
                     set_tag.update_tags(self.replace_tag, f"{tag}|{pic_time}|{pic_filename}|{pic_id}|{pic_tags}")
                 else:
-                    # 下载图片
-                    image_content = self.web.download_image(pic_url, referer=img_url, retries=50)
-                    
+                    # 下载图片，referer用详情页绝对url
+                    image_content = self.web.download_image(pic_url, referer=img_url_abs, retries=50)
                     if not image_content:
                         self.failed_cnt += 1
                         self.log(f'failed {tag} {pic_filename}')
@@ -363,15 +366,13 @@ class Downloader:
                     else:
                         size = len(image_content)
                         self.total_download_size += size
-                        
-                        # 保存图片
                         image_metadata = {
                             'pic_id': pic_id,
                             'tag_name': self.replace_tag,
                             'filename': pic_filename,
                             'new_filename': new_filename,
                             'file_path': original_save_path,
-                 'file_size': size,
+                            'file_size': size,
                             'pic_url': pic_url,
                             'pic_tags': pic_tags,
                             'pic_time': pic_time,
@@ -379,14 +380,11 @@ class Downloader:
                             'save_path': original_save_path,
                             'new_path': new_save_path
                         }
-                        
                         self._save_image(image_metadata, image_content)
                         self.downed_cnt += 1
                         file_counter += 1
-                        
                         formatted_size = format_size(size)
                         self.log(f'{i}/{total_images}({page}/{tag_config["endpage"]}) {tag} {file_counter-1} {pic_time} {pic_filename} {formatted_size}')
-                        # 直接写入tag自己的tags.txt（每个线程处理不同tag，无冲突）
                         set_tag.update_tags(self.replace_tag, f"{tag}|{pic_time}|{pic_filename}|{pic_id}|{pic_tags}")
                 
                 # 检查是否到达终点
